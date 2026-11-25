@@ -2481,7 +2481,11 @@ function applyChatDefaultsPayload(payload) {
   state.systemPrompt = String(chatDefaults.systemPrompt || "");
   state.selectedReasoning = chatDefaults.reasoning || "default";
   if (typeof chatDefaults.contextLength === "number") {
-    setContextLengthValue(chatDefaults.contextLength, { manual: true });
+    // Persisted defaults are a SEED, not a user choice: earlier builds
+    // auto-saved their fallback context value here, and treating it as manual
+    // permanently outranked server discovery. ensureSelectionDefaults re-derives
+    // it from the model once the model list resolves.
+    setContextLengthValue(chatDefaults.contextLength, { manual: false });
   } else if (!state.selectedContextLength || !state.contextLengthManual) {
     applySuggestedContextLength(findSelectedModel());
   }

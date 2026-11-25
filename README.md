@@ -1,14 +1,22 @@
 # Mobile AI Chat
 
-Mobile AI Chat is a lightweight Node.js web client for LM Studio that is designed to run in Docker and be usable from a phone on the same network.
+Mobile AI Chat is a lightweight, mobile-first Node.js web client for chatting with local and remote LLMs. It runs in Docker and is usable from a phone on the same network.
 
 This repository now tracks the Node.js runtime, the static client, and Docker and local development workflows only.
+
+## Providers
+
+- **LM Studio** — local LM Studio server, including model load/unload controls and MCP tool selection
+- **OpenAI Compatible** — any OpenAI-compatible `/v1` endpoint: OpenAI itself, a llama.cpp or Ollama server on your network, or any hosted OpenAI-style API
+- **Hermes Agent** — a Hermes Agent deployment exposed through its OpenAI-compatible endpoint
+
+Each provider keeps its own base URL and API key, configured per provider on the in-app Settings screen. LM Studio remains the default provider.
 
 ## Features
 
 - Mobile-first chat UI with a minimal layout
 - Saved chat history in SQLite
-- Model list, load, and unload controls
+- Model list, load, and unload controls (LM Studio; remote providers use model ids)
 - Model temperature control alongside context and reasoning settings
 - Streamed responses with live text rendering
 - Expandable reasoning and tool call sections
@@ -18,7 +26,7 @@ This repository now tracks the Node.js runtime, the static client, and Docker an
 
 ## Project Layout
 
-- `src/node`: Node.js runtime, SQLite integration, and LM Studio proxy logic
+- `src/node`: Node.js runtime, SQLite integration, and provider clients (LM Studio and OpenAI-compatible)
 - `src/MobileLmStudio/wwwroot`: static mobile-first client assets served by the Node.js runtime
 - `src/MobileLmStudio/appsettings.json`: default application settings used by the Node.js runtime
 - `Dockerfile`: container image definition
@@ -159,7 +167,9 @@ Runtime changes made in the UI are written to `appsettings.runtime.json`, so sav
 
 `appsettings.json` keys:
 
-- `LmStudio:BaseUrl`: LM Studio server URL
+- `Providers:ActiveProvider`: the provider the chat uses (`lmstudio`, `openai`, or `hermes-agent`)
+- `Providers:Profiles:<provider-id>`: per-provider `BaseUrl` and `ApiToken`
+- `LmStudio:BaseUrl`: LM Studio server URL (legacy alias for `Providers:Profiles:lmstudio:BaseUrl`)
 - `LmStudio:ApiToken`: bearer token used for LM Studio requests and plugin-based MCP access
 - `LmStudio:McpConfigPath`: path to LM Studio `mcp.json`
 - `Security:PinHash` and `Security:PinSalt`: PBKDF2-protected PIN values

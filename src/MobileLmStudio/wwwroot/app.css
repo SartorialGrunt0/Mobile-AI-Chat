@@ -1,9 +1,9 @@
 :root {
   color-scheme: light;
   font-size: 15px;
-  --canvas: #f4efe4;
-  --panel: rgba(255, 250, 242, 0.84);
-  --panel-strong: #fffaf2;
+  --canvas: #ffffff;
+  --panel: rgba(255, 255, 255, 0.84);
+  --panel-strong: #ffffff;
   --border: rgba(36, 47, 61, 0.14);
   --ink: #17212b;
   --muted: #5a6470;
@@ -18,8 +18,8 @@
   --font-mono: "Cascadia Code", "Consolas", monospace;
   --bg-warm: rgba(197, 95, 56, 0.14);
   --bg-cool: rgba(23, 107, 127, 0.18);
-  --bg-start: #f7f2e8;
-  --bg-end: #efe7d8;
+  --bg-start: #ffffff;
+  --bg-end: #ffffff;
   --overlay: rgba(23, 33, 43, 0.34);
   --surface-muted: rgba(255, 255, 255, 0.72);
   --surface-soft: rgba(255, 255, 255, 0.42);
@@ -404,6 +404,42 @@ body.drawer-open .drawer-backdrop {
   text-transform: none;
   letter-spacing: normal;
   font-size: 0.8rem;
+}
+
+.mcp-server-list {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0.4rem 0;
+}
+
+.mcp-server-row {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  border-radius: 10px;
+}
+
+.mcp-server-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.mcp-server-row .checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text, inherit);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.mcp-server-row input[type="text"],
+.mcp-server-row input[type="password"] {
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .toggle-field {

@@ -7,9 +7,10 @@ const { ChatRepository } = require("./chat-repository");
 const { buildChatExport, buildDownloadName, buildMessageExport } = require("./chat-export");
 const { readConfig } = require("./config");
 const { createLogger } = require("./logger");
-const { LmStudioClient } = require("./lm-studio-client");
-const { getServers } = require("./mcp-catalog");
-const { buildAssistantPersistence, relayLmStudioStream, writeSse } = require("./lm-studio-stream");
+const { buildMcpServersResponse, findEnabledServers, normalizeMcpServersPayload, resolveMcpServerTokens, validateMcpServers } = require("./mcp-config");
+const { buildAssistantPersistence, writeSse } = require("./lm-studio-stream");
+const { ProviderClient } = require("./provider-client");
+const { getActiveProviderId, getChatDefaultsForProvider, getProviderDefinition, getProviderProfile, listProviderDefinitions, normalizeProviderId } = require("./provider-config");
 const { saveSettings } = require("./settings-store");
 
 function buildListenAddress(config) {
@@ -23,18 +24,16 @@ function buildListenAddress(config) {
 }
 
 function createApp() {
-  const { config, runtimeSettingsPath, logDirectory } = readConfig();
+  const { config, baseConfigPath, runtimeSettingsPath, logDirectory } = readConfig();
   const logger = createLogger(logDirectory);
   const staticRoot = path.join(__dirname, "..", "MobileLmStudio", "wwwroot");
   const katexRoot = path.join(__dirname, "..", "..", "node_modules", "katex", "dist");
   const repository = new ChatRepository(config.Storage.ConnectionString);
-  const lmStudioClient = new LmStudioClient(() => ({
-    baseUrl: state.config.LmStudio?.BaseUrl,
-    apiToken: state.config.LmStudio?.ApiToken
-  }));
+  const providerClient = new ProviderClient(() => state.config);
   const app = express();
   const state = {
     config,
+    baseConfigPath,
     runtimeSettingsPath,
     logger,
     defaultUrl: buildListenAddress(config).defaultUrl,
@@ -61,12 +60,22 @@ function createApp() {
   app.get("/api/bootstrap", (request, response) => {
     const currentConfig = request.appState.config;
     const requireLogin = hasPin(currentConfig.Security);
+    const activeProviderId = getActiveProviderId(currentConfig);
+    const activeProviderDefinition = getProviderDefinition(activeProviderId);
+    const activeProviderProfile = getProviderProfile(currentConfig, activeProviderId);
+    const providerConfigured = Boolean(activeProviderProfile.BaseUrl);
+    const mcpConfigured = activeProviderDefinition.supportsMcp && (currentConfig.McpServers || []).some(server => server.Enabled);
     response.json({
       requireLogin,
       authenticated: !requireLogin || isAuthenticated(request, currentConfig.Security),
-      lmStudioConfigured: Boolean(currentConfig.LmStudio?.BaseUrl),
-      mcpConfigured: Boolean(currentConfig.LmStudio?.McpConfigPath),
-      hasApiToken: Boolean(currentConfig.LmStudio?.ApiToken),
+      lmStudioConfigured: providerConfigured,
+      providerConfigured,
+      activeProvider: activeProviderId,
+      providerLabel: activeProviderDefinition.displayName,
+      providerSupportsModelLoad: activeProviderDefinition.supportsModelLoad,
+      providerSupportsMcp: activeProviderDefinition.supportsMcp,
+      mcpConfigured,
+      hasApiToken: Boolean(activeProviderProfile.ApiToken),
       defaultUrl: request.appState.defaultUrl,
       chatFontScale: currentConfig.Ui?.ChatFontScale || 1
     });
@@ -128,13 +137,14 @@ function createApp() {
   app.get("/api/chat-defaults", (request, response) => {
     const currentConfig = request.appState.config;
     response.json({
+      activeProvider: getActiveProviderId(currentConfig),
       chatDefaults: buildChatDefaultsResponse(currentConfig),
       adaptiveMemory: buildAdaptiveMemoryResponse(currentConfig)
     });
   });
 
   app.post("/api/settings", (request, response) => {
-    const payload = normalizeSettingsPayload(request.body);
+    const payload = normalizeSettingsPayload(request.body, request.appState.config);
     const wasAuthenticated = isAuthenticated(request, request.appState.config.Security);
     const validationErrors = validateSettings(payload);
     if (validationErrors) {
@@ -159,17 +169,18 @@ function createApp() {
     }
 
     try {
-      const resolvedApiToken = payload.keepApiToken
-        ? (request.appState.config.LmStudio?.ApiToken || "")
-        : payload.apiToken;
+      const resolvedProviders = resolveSettingsProviderTokens(payload, request.appState.config);
+      const resolvedMcpServers = resolveMcpServerTokens(payload.mcpServers, request.appState.config.McpServers || []);
       const resolvedPayload = {
         ...payload,
-        apiToken: resolvedApiToken,
-        chatDefaults: buildChatDefaultsResponse(request.appState.config)
+        providers: resolvedProviders,
+        mcpServers: resolvedMcpServers ?? (request.appState.config.McpServers || []).map(server => ({ ...server })),
+        chatDefaults: buildChatDefaultsResponse(request.appState.config, payload.activeProvider),
+        chatDefaultsByProvider: buildChatDefaultsByProviderResponse(request.appState.config)
       };
       persistRuntimeSettings(request.appState, resolvedPayload, security);
-      scheduleAdaptiveMemoryRefresh(request.appState, lmStudioClient);
-      void refreshAdaptiveMemoryIfDue(request.appState, lmStudioClient);
+      scheduleAdaptiveMemoryRefresh(request.appState, providerClient);
+      void refreshAdaptiveMemoryIfDue(request.appState, providerClient);
       if (hasPin(security) && wasAuthenticated) {
         appendAuthCookie(response, security);
       } else {
@@ -196,10 +207,9 @@ function createApp() {
     }
 
     try {
-      const payload = {
-        ...buildRuntimeSettingsPayload(request.appState.config),
-        chatDefaults
-      };
+      const payload = buildRuntimeSettingsPayload(request.appState.config);
+      payload.chatDefaults = chatDefaults;
+      payload.chatDefaultsByProvider[payload.activeProvider] = chatDefaults;
       persistRuntimeSettings(request.appState, payload);
       response.json({
         chatDefaults: buildChatDefaultsResponse(request.appState.config),
@@ -213,42 +223,35 @@ function createApp() {
     }
   });
 
-  app.get("/api/mcp/servers", async (request, response) => {
-    try {
-      const servers = await getServers(request.appState.config.LmStudio?.McpConfigPath);
-      response.json(servers);
-    } catch (error) {
-      request.appState.logger.error(`Failed to load MCP servers from ${request.appState.config.LmStudio?.McpConfigPath || "(empty)"}.`, error);
-      response.status(500).json({
-        detail: error.message
-      });
-    }
+  app.get("/api/mcp/servers", (request, response) => {
+    response.json(buildMcpServersResponse(request.appState.config.McpServers || []));
   });
 
   app.get("/api/models", async (request, response) => {
     try {
-      response.json(await lmStudioClient.getModels());
+      response.json(await providerClient.getModels());
     } catch (error) {
-      request.appState.logger.error(`Failed to load the LM Studio model catalog from ${request.appState.config.LmStudio?.BaseUrl || "(empty)"}.`, error);
-      response.status(502).json({ detail: error.message });
+      const providerInfo = providerClient.getActiveProviderInfo();
+      request.appState.logger.error(`Failed to load the ${providerInfo.displayName} model catalog from ${providerInfo.baseUrl || "(empty)"}.`, error);
+      response.status(error.statusCode || 502).json({ detail: error.message });
     }
   });
 
   app.post("/api/models/load", async (request, response) => {
     try {
-      response.json(await lmStudioClient.loadModel(normalizeModelLoadRequest(request.body)));
+      response.json(await providerClient.loadModel(normalizeModelLoadRequest(request.body)));
     } catch (error) {
       request.appState.logger.error(`Failed to load model ${request.body?.model || "(empty)"}.`, error);
-      response.status(502).json({ detail: error.message });
+      response.status(error.statusCode || 502).json({ detail: error.message });
     }
   });
 
   app.post("/api/models/unload", async (request, response) => {
     try {
-      response.json(await lmStudioClient.unloadModel({ instanceId: String(request.body?.instanceId || "") }));
+      response.json(await providerClient.unloadModel({ instanceId: String(request.body?.instanceId || "") }));
     } catch (error) {
       request.appState.logger.error(`Failed to unload model instance ${request.body?.instanceId || "(empty)"}.`, error);
-      response.status(502).json({ detail: error.message });
+      response.status(error.statusCode || 502).json({ detail: error.message });
     }
   });
 
@@ -381,7 +384,7 @@ function createApp() {
         return;
       }
 
-      const title = await maybeAutoTitleChat(request, lmStudioClient, {
+      const title = await maybeAutoTitleChat(request, providerClient, {
         chatId: request.params.chatId,
         input: String(request.body?.input || ""),
         modelKey: chat.modelKey,
@@ -428,7 +431,7 @@ function createApp() {
     };
 
     request.appState.repository.deleteLastAssistantMessage(retryContext.chatId);
-    await streamChat(request, response, lmStudioClient, retryRequest, {
+    await streamChat(request, response, providerClient, retryRequest, {
       previousResponseId: retryContext.previousResponseId,
       persistChatId: retryContext.chatId
     });
@@ -453,7 +456,7 @@ function createApp() {
     }
 
     request.appState.repository.saveUserMessage(chat.id, chatRequest);
-    await streamChat(request, response, lmStudioClient, chatRequest, {
+    await streamChat(request, response, providerClient, chatRequest, {
       previousResponseId: chat.lastResponseId,
       persistChatId: chat.id,
       exposeChatId: true
@@ -482,7 +485,7 @@ function createApp() {
     }
 
     request.appState.repository.saveUserMessage(chatId, chatRequest);
-    await streamChat(request, response, lmStudioClient, chatRequest, {
+    await streamChat(request, response, providerClient, chatRequest, {
       previousResponseId: previousResponseId || null,
       persistChatId: chatId,
     });
@@ -492,35 +495,107 @@ function createApp() {
     response.sendFile(path.join(staticRoot, "index.html"));
   });
 
-  scheduleAdaptiveMemoryRefresh(state, lmStudioClient);
-  void refreshAdaptiveMemoryIfDue(state, lmStudioClient);
+  scheduleAdaptiveMemoryRefresh(state, providerClient);
+  void refreshAdaptiveMemoryIfDue(state, providerClient);
 
   return { app, config, logger };
 }
 
 function buildSettingsResponse(config) {
+  const activeProvider = getActiveProviderId(config);
+  const activeProfile = getProviderProfile(config, activeProvider);
   return {
-    baseUrl: config.LmStudio?.BaseUrl || "",
-    hasApiToken: Boolean(config.LmStudio?.ApiToken),
-    mcpConfigPath: config.LmStudio?.McpConfigPath || "",
+    activeProvider,
+    providerLabel: getProviderDefinition(activeProvider).displayName,
+    providers: listProviderDefinitions().map(definition => {
+      const profile = getProviderProfile(config, definition.id);
+      return {
+        id: definition.id,
+        displayName: definition.displayName,
+        kind: definition.kind,
+        baseUrl: profile.BaseUrl || "",
+        baseUrlPlaceholder: definition.baseUrlPlaceholder,
+        modelPlaceholder: definition.modelPlaceholder,
+        hasApiToken: Boolean(profile.ApiToken),
+        supportsModelLoad: definition.supportsModelLoad,
+        supportsMcp: definition.supportsMcp,
+      };
+    }),
+    baseUrl: activeProfile.BaseUrl || "",
+    hasApiToken: Boolean(activeProfile.ApiToken),
+    mcpServers: buildMcpServersResponse(config.McpServers || []),
     chatFontScale: config.Ui?.ChatFontScale || 1,
     requireLogin: hasPin(config.Security),
     adaptiveMemory: buildAdaptiveMemoryResponse(config)
   };
 }
 
-function buildChatDefaultsResponse(config) {
+function buildChatDefaultsResponse(config, providerId = getActiveProviderId(config)) {
+  const chatDefaults = getChatDefaultsForProvider(config, providerId);
   return {
-    modelKey: String(config.Ui?.ChatDefaults?.ModelKey || "").trim(),
-    systemPrompt: String(config.Ui?.ChatDefaults?.SystemPrompt || ""),
-    reasoning: optionalTrimmedString(config.Ui?.ChatDefaults?.Reasoning),
-    contextLength: toOptionalInteger(config.Ui?.ChatDefaults?.ContextLength),
-    temperature: toOptionalFloat(config.Ui?.ChatDefaults?.Temperature),
-    topK: toOptionalInteger(config.Ui?.ChatDefaults?.TopK),
-    topP: toOptionalFloat(config.Ui?.ChatDefaults?.TopP),
-    minP: toOptionalFloat(config.Ui?.ChatDefaults?.MinP),
-    repeatPenalty: toOptionalFloat(config.Ui?.ChatDefaults?.RepeatPenalty)
+    modelKey: chatDefaults.ModelKey,
+    systemPrompt: chatDefaults.SystemPrompt,
+    reasoning: optionalTrimmedString(chatDefaults.Reasoning),
+    contextLength: toOptionalInteger(chatDefaults.ContextLength),
+    temperature: toOptionalFloat(chatDefaults.Temperature),
+    topK: toOptionalInteger(chatDefaults.TopK),
+    topP: toOptionalFloat(chatDefaults.TopP),
+    minP: toOptionalFloat(chatDefaults.MinP),
+    repeatPenalty: toOptionalFloat(chatDefaults.RepeatPenalty)
   };
+}
+
+function buildChatDefaultsByProviderResponse(config) {
+  const defaults = {};
+  for (const definition of listProviderDefinitions()) {
+    defaults[definition.id] = buildChatDefaultsResponse(config, definition.id);
+  }
+  return defaults;
+}
+
+function normalizeSettingsPayload(payload, currentConfig) {
+  const activeProvider = normalizeProviderId(payload?.activeProvider || getActiveProviderId(currentConfig));
+  const rawProviders = payload?.providers && typeof payload.providers === "object"
+    ? payload.providers
+    : {};
+  const providers = {};
+  for (const definition of listProviderDefinitions()) {
+    const currentProfile = getProviderProfile(currentConfig, definition.id);
+    const rawProvider = rawProviders[definition.id] && typeof rawProviders[definition.id] === "object"
+      ? rawProviders[definition.id]
+      : definition.id === activeProvider
+        ? payload
+        : {};
+    providers[definition.id] = {
+      baseUrl: String(rawProvider.baseUrl ?? (definition.id === activeProvider ? payload?.baseUrl : currentProfile.BaseUrl) ?? "").trim(),
+      apiToken: String(rawProvider.apiToken ?? (definition.id === activeProvider ? payload?.apiToken : "") ?? "").trim(),
+      keepApiToken: Boolean(rawProvider.keepApiToken ?? (definition.id === activeProvider ? payload?.keepApiToken : Boolean(currentProfile.ApiToken))),
+    };
+  }
+
+  return {
+    activeProvider,
+    providers,
+    mcpServers: normalizeMcpServersPayload(payload?.mcpServers),
+    chatFontScale: toOptionalFloat(payload?.chatFontScale) || 1,
+    requireLogin: Boolean(payload?.requireLogin),
+    pin: String(payload?.pin || "").trim(),
+    adaptiveMemory: normalizeAdaptiveMemoryPayload(payload?.adaptiveMemory)
+  };
+}
+
+function resolveSettingsProviderTokens(payload, currentConfig) {
+  const providers = {};
+  for (const definition of listProviderDefinitions()) {
+    const currentProfile = getProviderProfile(currentConfig, definition.id);
+    const nextProfile = payload.providers[definition.id];
+    providers[definition.id] = {
+      ...nextProfile,
+      apiToken: nextProfile.keepApiToken ? (currentProfile.ApiToken || "") : nextProfile.apiToken
+    };
+  }
+
+  return providers;
 }
 
 function buildAdaptiveMemoryResponse(config) {
@@ -531,25 +606,6 @@ function buildAdaptiveMemoryResponse(config) {
     lastUpdatedUtc: String(config.Ui?.AdaptiveMemory?.LastUpdatedUtc || "").trim(),
     lastReviewedUtc: String(config.Ui?.AdaptiveMemory?.LastReviewedUtc || "").trim(),
     sourceCursorUtc: String(config.Ui?.AdaptiveMemory?.SourceCursorUtc || "").trim()
-  };
-}
-
-function normalizeSettingsPayload(payload) {
-  return {
-    baseUrl: String(payload?.baseUrl || "").trim(),
-    apiToken: String(payload?.apiToken || "").trim(),
-    keepApiToken: Boolean(payload?.keepApiToken),
-    mcpConfigPath: String(payload?.mcpConfigPath || "").trim(),
-    mcpConfigUpload: payload?.mcpConfigUpload && typeof payload.mcpConfigUpload === "object"
-      ? {
-          fileName: String(payload.mcpConfigUpload.fileName || "").trim(),
-          content: String(payload.mcpConfigUpload.content || "")
-        }
-      : null,
-    chatFontScale: toOptionalFloat(payload?.chatFontScale) || 1,
-    requireLogin: Boolean(payload?.requireLogin),
-    pin: String(payload?.pin || "").trim(),
-    adaptiveMemory: normalizeAdaptiveMemoryPayload(payload?.adaptiveMemory)
   };
 }
 
@@ -621,36 +677,31 @@ function validateSettings(settings) {
     return adaptiveMemoryErrors;
   }
 
-  if (settings.mcpConfigUpload?.content) {
+  const mcpServerErrors = validateMcpServers(settings.mcpServers);
+  if (mcpServerErrors) {
+    return mcpServerErrors;
+  }
+
+  for (const definition of listProviderDefinitions()) {
+    const providerSettings = settings.providers?.[definition.id];
+    if (!providerSettings?.baseUrl) {
+      continue;
+    }
+
     try {
-      const parsed = JSON.parse(settings.mcpConfigUpload.content);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return {
-          mcpConfigUpload: ["Uploaded MCP config must contain a JSON object."]
-        };
+      const parsed = new URL(providerSettings.baseUrl);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        continue;
       }
     } catch {
-      return {
-        mcpConfigUpload: ["Uploaded MCP config must contain valid JSON."]
-      };
     }
+
+    return {
+      [`providers.${definition.id}.baseUrl`]: [`${definition.displayName} base URL must be an absolute http:// or https:// URL.`]
+    };
   }
 
-  if (!settings.baseUrl) {
-    return null;
-  }
-
-  try {
-    const parsed = new URL(settings.baseUrl);
-    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-      return null;
-    }
-  } catch {
-  }
-
-  return {
-    baseUrl: ["Base URL must be an absolute http:// or https:// URL."]
-  };
+  return null;
 }
 
 function validateChatDefaults(chatDefaults) {
@@ -696,57 +747,36 @@ function validateAdaptiveMemory(adaptiveMemory) {
 }
 
 function buildRuntimeSettingsPayload(config) {
+  const activeProvider = getActiveProviderId(config);
+  const providers = {};
+  for (const definition of listProviderDefinitions()) {
+    const profile = getProviderProfile(config, definition.id);
+    providers[definition.id] = {
+      baseUrl: profile.BaseUrl || "",
+      apiToken: profile.ApiToken || "",
+      keepApiToken: Boolean(profile.ApiToken),
+    };
+  }
+
   return {
-    baseUrl: config.LmStudio?.BaseUrl || "",
-    apiToken: config.LmStudio?.ApiToken || "",
-    keepApiToken: Boolean(config.LmStudio?.ApiToken),
-    mcpConfigPath: config.LmStudio?.McpConfigPath || "",
-    mcpConfigUpload: null,
+    activeProvider,
+    providers,
+    mcpServers: (config.McpServers || []).map(server => ({ ...server })),
     chatFontScale: config.Ui?.ChatFontScale || 1,
     requireLogin: hasPin(config.Security),
     pin: "",
-    chatDefaults: buildChatDefaultsResponse(config),
+    chatDefaults: buildChatDefaultsResponse(config, activeProvider),
+    chatDefaultsByProvider: buildChatDefaultsByProviderResponse(config),
     adaptiveMemory: buildAdaptiveMemoryResponse(config)
   };
 }
 
 function persistRuntimeSettings(appState, payload, security = appState.config.Security) {
   saveSettings(appState.runtimeSettingsPath, payload, security);
-  appState.config = {
-    ...appState.config,
-    LmStudio: {
-      ...appState.config.LmStudio,
-      BaseUrl: payload.baseUrl,
-      ApiToken: payload.apiToken,
-      McpConfigPath: payload.mcpConfigUpload?.content
-        ? path.join(path.dirname(appState.runtimeSettingsPath), "mcp.uploaded.json")
-        : payload.mcpConfigPath
-    },
-    Security: security,
-    Ui: {
-      ...appState.config.Ui,
-      ChatFontScale: payload.chatFontScale,
-      ChatDefaults: {
-        ModelKey: payload.chatDefaults?.modelKey || "",
-        SystemPrompt: payload.chatDefaults?.systemPrompt || "",
-        Reasoning: payload.chatDefaults?.reasoning || "",
-        ContextLength: payload.chatDefaults?.contextLength ?? null,
-        Temperature: payload.chatDefaults?.temperature ?? null,
-        TopK: payload.chatDefaults?.topK ?? null,
-        TopP: payload.chatDefaults?.topP ?? null,
-        MinP: payload.chatDefaults?.minP ?? null,
-        RepeatPenalty: payload.chatDefaults?.repeatPenalty ?? null
-      },
-      AdaptiveMemory: {
-        Enabled: payload.adaptiveMemory?.enabled === true,
-        MaxWords: normalizeAdaptiveMemoryWordLimit(payload.adaptiveMemory?.maxWords),
-        Summary: payload.adaptiveMemory?.summary || "",
-        LastUpdatedUtc: payload.adaptiveMemory?.lastUpdatedUtc || "",
-        LastReviewedUtc: payload.adaptiveMemory?.lastReviewedUtc || "",
-        SourceCursorUtc: payload.adaptiveMemory?.sourceCursorUtc || ""
-      }
-    }
-  };
+  appState.config = readConfig({
+    baseConfigPath: appState.baseConfigPath,
+    runtimeSettingsPath: appState.runtimeSettingsPath,
+  }).config;
 }
 
 function normalizeModelLoadRequest(payload) {
@@ -779,9 +809,18 @@ function normalizeMcpServerIds(value) {
   return Array.isArray(value) ? value.map(entry => String(entry || "").trim()).filter(Boolean) : [];
 }
 
-async function streamChat(request, response, lmStudioClient, chatRequest, options = {}) {
-  const availableServers = await getServers(request.appState.config.LmStudio?.McpConfigPath);
-  const integrations = buildMcpIntegrations(availableServers, chatRequest.mcpServerIds || []);
+async function streamChat(request, response, providerClient, chatRequest, options = {}) {
+  const activeProviderId = getActiveProviderId(request.appState.config);
+  const activeProviderDefinition = getProviderDefinition(activeProviderId);
+  const activeServers = activeProviderDefinition.supportsMcp
+    ? findEnabledServers(request.appState.config.McpServers || [], chatRequest.mcpServerIds || [])
+    : [];
+  const integrations = activeProviderDefinition.kind === "lmstudio" ? buildMcpIntegrations(activeServers) : [];
+  const chatConversation = options.persistChatId
+    ? request.appState.repository.getChat(options.persistChatId)
+    : null;
+  const conversationMessages = buildConversationMessages(chatConversation);
+  const includeAdaptiveMemory = !conversationMessages.some(message => message.role === "assistant");
 
   const streamAbortController = options.persistChatId ? new AbortController() : null;
   if (options.persistChatId) {
@@ -831,47 +870,34 @@ async function streamChat(request, response, lmStudioClient, chatRequest, option
 
   try {
     const streamStartedAtMs = Date.now();
-    const lmResponse = await lmStudioClient.startChatStream({
+    const finalResponse = await providerClient.streamChat({
       model: chatRequest.model,
-      input: buildLmStudioInput(chatRequest),
-      system_prompt: buildEffectiveSystemPrompt(chatRequest.systemPrompt, !options.previousResponseId ? buildAdaptiveMemoryResponse(request.appState.config) : null),
+      input: chatRequest.input,
+      attachments: chatRequest.attachments,
+      messages: conversationMessages,
+      systemPrompt: buildEffectiveSystemPrompt(chatRequest.systemPrompt, includeAdaptiveMemory ? buildAdaptiveMemoryResponse(request.appState.config) : null),
       reasoning: chatRequest.reasoning,
-      stream: true,
-      store: true,
-      context_length: chatRequest.contextLength,
+      contextLength: chatRequest.contextLength,
       temperature: chatRequest.temperature,
-      top_k: chatRequest.topK,
-      top_p: chatRequest.topP,
-      min_p: chatRequest.minP,
-      repeat_penalty: chatRequest.repeatPenalty,
-      previous_response_id: options.previousResponseId || null,
-      integrations: integrations.length > 0 ? integrations : null
-    }, streamAbortController?.signal);
-
-    if (!lmResponse.ok) {
-      const details = await lmStudioClient.readError(lmResponse);
-      if (!await writeStreamEvent("error", JSON.stringify({ message: details }))) {
-        request.appState.logger.error(`LM Studio stream failed for chat ${options.persistChatId || "(unknown)"} after the client disconnected: ${details}`);
-      }
-
-      if (canWriteToClient()) {
-        response.end();
-      }
-      return;
-    }
-
-    const finalResponse = await relayLmStudioStream(lmResponse.body, writeStreamEvent);
+      topK: chatRequest.topK,
+      topP: chatRequest.topP,
+      minP: chatRequest.minP,
+      repeatPenalty: chatRequest.repeatPenalty,
+      previousResponseId: options.previousResponseId || null,
+      integrations: integrations.length > 0 ? integrations : null,
+      mcpServers: activeProviderDefinition.kind === "lmstudio" ? null : (activeServers.length > 0 ? activeServers : null)
+    }, streamAbortController?.signal, writeStreamEvent);
     if (finalResponse) {
       const assistant = buildAssistantPersistence(finalResponse, chatRequest.model, chatRequest.contextLength, {
         totalTimeSeconds: Math.max((Date.now() - streamStartedAtMs) / 1000, 0)
       });
       request.appState.repository.saveAssistantMessage(options.persistChatId, chatRequest, assistant);
-      void maybeAutoTitleChat(request, lmStudioClient, {
+      void maybeAutoTitleChat(request, providerClient, {
         chatId: options.persistChatId,
         input: chatRequest.input,
         modelKey: chatRequest.model
       });
-      void refreshAdaptiveMemoryIfDue(request.appState, lmStudioClient);
+      void refreshAdaptiveMemoryIfDue(request.appState, providerClient);
     }
 
     if (canWriteToClient()) {
@@ -888,7 +914,7 @@ async function streamChat(request, response, lmStudioClient, chatRequest, option
 
     if (!response.writableEnded) {
       if (!isAbort) {
-        await writeStreamEvent("error", JSON.stringify({ message: error.message || "The LM Studio stream returned an error." }));
+        await writeStreamEvent("error", JSON.stringify({ message: error.message || "The provider stream returned an error." }));
       }
       response.end();
     }
@@ -900,42 +926,29 @@ async function streamChat(request, response, lmStudioClient, chatRequest, option
   }
 }
 
-function buildMcpIntegrations(availableServers, selectedServerIds) {
-  const requestedIds = [...new Set((selectedServerIds || [])
-    .map(serverId => normalizeSelectedMcpServerId(serverId))
-    .filter(Boolean)
-    .map(serverId => serverId.toLowerCase()))];
-
-  if (requestedIds.length === 0) {
+function buildConversationMessages(chat) {
+  if (!Array.isArray(chat?.messages)) {
     return [];
   }
 
-  const seen = new Set();
-  const integrations = [];
-
-  for (const server of availableServers) {
-    const serverId = String(server.id || "").toLowerCase();
-    const serverLabel = String(server.label || "").toLowerCase();
-    if (!requestedIds.includes(serverId) && !requestedIds.includes(serverLabel)) {
-      continue;
-    }
-
-    const integrationId = `mcp/${server.id}`;
-    if (seen.has(integrationId.toLowerCase())) {
-      continue;
-    }
-
-    seen.add(integrationId.toLowerCase());
-    integrations.push({ type: "plugin", id: integrationId });
-  }
-
-  return integrations;
+  return chat.messages
+    .filter(message => message.role === "user" || message.role === "assistant")
+    .map(message => ({
+      role: message.role,
+      content: message.content || "",
+      attachments: Array.isArray(message.attachments) ? message.attachments : [],
+    }));
 }
 
-function normalizeSelectedMcpServerId(serverId) {
-  const normalized = String(serverId || "").trim();
-  return normalized.toLowerCase().startsWith("mcp/") ? normalized.slice(4) : normalized;
+function buildMcpIntegrations(servers) {
+  return (servers || []).map(server => ({
+    type: "ephemeral_mcp",
+    server_label: server.Label,
+    server_url: server.Url,
+    ...(server.Token ? { headers: { Authorization: `Bearer ${server.Token}` } } : {})
+  }));
 }
+
 
 function buildLmStudioInput(chatRequest) {
   const attachments = chatRequest.attachments || [];

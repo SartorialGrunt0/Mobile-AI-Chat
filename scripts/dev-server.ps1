@@ -3,7 +3,6 @@ param(
     [int]$Port = 5081,
     [string]$LmStudioUrl = "http://127.0.0.1:1234",
     [string]$LmStudioApiToken = "",
-    [string]$McpConfigPath = "",
     [string]$DataPath = ""
 )
 
@@ -71,13 +70,12 @@ $serverArguments = @(
     "--Web:Urls=$listenUrl",
     "--LmStudio:BaseUrl=$LmStudioUrl",
     "--LmStudio:ApiToken=$LmStudioApiToken",
-    "--LmStudio:McpConfigPath=$McpConfigPath",
     "--Storage:ConnectionString=$connectionString",
     "--Security:PinHash=",
     "--Security:PinSalt="
 )
 
-Write-Host "Starting Mobile LM Studio from source"
+Write-Host "Starting Mobile AI Chat from source"
 Write-Host "Runtime: Node.js"
 Write-Host "Configuration: $Configuration (compatibility flag; ignored by the Node.js runtime)"
 Write-Host "Entry: $serverPath"

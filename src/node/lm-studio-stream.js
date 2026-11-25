@@ -93,7 +93,7 @@ function normalizeResponseStats(response, requestedContextLength, overrides = {}
   const totalOutputTokens = firstFiniteNumber(stats.totalOutputTokens, stats.total_output_tokens);
   const reasoningOutputTokens = firstFiniteNumber(stats.reasoningOutputTokens, stats.reasoning_output_tokens);
 
-  return {
+  const statsBlock = {
     inputTokens: firstFiniteNumber(stats.inputTokens, stats.input_tokens),
     totalOutputTokens,
     answerOutputTokens: typeof totalOutputTokens === "number"
@@ -102,10 +102,19 @@ function normalizeResponseStats(response, requestedContextLength, overrides = {}
     reasoningOutputTokens,
     tokensPerSecond: firstFiniteNumber(stats.tokensPerSecond, stats.tokens_per_second),
     timeToFirstTokenSeconds: firstFiniteNumber(stats.timeToFirstTokenSeconds, stats.time_to_first_token_seconds),
+    promptPerSecond: firstFiniteNumber(stats.promptPerSecond, stats.prompt_per_second),
+    cachedInputTokens: firstFiniteNumber(stats.cachedInputTokens, stats.cached_input_tokens),
     modelLoadTimeSeconds: firstFiniteNumber(stats.modelLoadTimeSeconds, stats.model_load_time_seconds),
     totalTimeSeconds: firstFiniteNumber(overrides.totalTimeSeconds, stats.totalTimeSeconds, stats.total_time_seconds),
     contextLimit: resolveResponseContextLimit(response, requestedContextLength)
   };
+
+  // Prefill rate is not reported natively; estimate prompt tokens over TTFT.
+  if (statsBlock.promptPerSecond === null && typeof statsBlock.inputTokens === "number" && statsBlock.inputTokens > 0 && typeof statsBlock.timeToFirstTokenSeconds === "number" && statsBlock.timeToFirstTokenSeconds > 0) {
+    statsBlock.promptPerSecond = statsBlock.inputTokens / statsBlock.timeToFirstTokenSeconds;
+  }
+
+  return statsBlock;
 }
 
 function buildAssistantPersistence(response, modelKey, contextLength, options = {}) {

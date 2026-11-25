@@ -103,6 +103,7 @@ function normalizeResponseStats(response, requestedContextLength, overrides = {}
     tokensPerSecond: firstFiniteNumber(stats.tokensPerSecond, stats.tokens_per_second),
     timeToFirstTokenSeconds: firstFiniteNumber(stats.timeToFirstTokenSeconds, stats.time_to_first_token_seconds),
     promptPerSecond: firstFiniteNumber(stats.promptPerSecond, stats.prompt_per_second),
+    cachedInputTokens: firstFiniteNumber(stats.cachedInputTokens, stats.cached_input_tokens),
     modelLoadTimeSeconds: firstFiniteNumber(stats.modelLoadTimeSeconds, stats.model_load_time_seconds),
     totalTimeSeconds: firstFiniteNumber(overrides.totalTimeSeconds, stats.totalTimeSeconds, stats.total_time_seconds),
     contextLimit: resolveResponseContextLimit(response, requestedContextLength)

@@ -2583,6 +2583,14 @@ function renderMessageStats(stats) {
   if (typeof stats.inputTokens === "number") {
     parts.push(`${formatInteger(stats.inputTokens)} prompt`);
   }
+  // Prefix-cache telemetry, shown whenever the provider reports it: a reported
+  // miss reads as "cache miss", a partial hit as a percentage. Providers that do
+  // not report cached tokens (e.g. LM Studio stats) simply omit this part.
+  if (typeof stats.cachedInputTokens === "number" && typeof stats.inputTokens === "number" && stats.inputTokens > 0) {
+    parts.push(stats.cachedInputTokens > 0
+      ? `${Math.round((stats.cachedInputTokens / stats.inputTokens) * 100)}% prompt cache`
+      : "prompt cache miss");
+  }
   if (typeof stats.totalOutputTokens === "number") {
     parts.push(`${formatInteger(stats.totalOutputTokens)} generated`);
   }
@@ -4322,6 +4330,7 @@ function normalizeStreamStats(result, modelKey) {
     tokensPerSecond: firstFiniteNumber(source.tokensPerSecond, source.tokens_per_second),
     timeToFirstTokenSeconds: firstFiniteNumber(source.timeToFirstTokenSeconds, source.time_to_first_token_seconds),
     promptPerSecond: firstFiniteNumber(source.promptPerSecond, source.prompt_per_second),
+    cachedInputTokens: firstFiniteNumber(source.cachedInputTokens, source.cached_input_tokens),
     modelLoadTimeSeconds: firstFiniteNumber(source.modelLoadTimeSeconds, source.model_load_time_seconds),
     totalTimeSeconds: firstFiniteNumber(source.totalTimeSeconds, source.total_time_seconds),
     contextLimit: resolveResponseContextLimit(result, modelKey),

@@ -175,7 +175,7 @@ class ProviderClient {
     };
 
     const messages = buildOpenAiMessages(request.messages, request.systemPrompt);
-    const usageTotals = { input_tokens: null, output_tokens: null };
+    const usageTotals = { input_tokens: null, output_tokens: null, cached_input_tokens: null };
     const reasoningParts = [];
     const contentParts = [];
     const toolCallRecords = [];
@@ -925,6 +925,7 @@ async function streamSingleRound(providerClient, connection, request, messages, 
 function accumulateUsage(totals, usage) {
   const inputTokens = firstFiniteNumber(usage?.input_tokens ?? usage?.prompt_tokens);
   const outputTokens = firstFiniteNumber(usage?.output_tokens ?? usage?.completion_tokens);
+  const cachedTokens = firstFiniteNumber(usage?.prompt_tokens_details?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cached_tokens);
 
   if (typeof inputTokens === "number") {
     totals.input_tokens = (totals.input_tokens ?? 0) + inputTokens;
@@ -932,6 +933,10 @@ function accumulateUsage(totals, usage) {
 
   if (typeof outputTokens === "number") {
     totals.output_tokens = (totals.output_tokens ?? 0) + outputTokens;
+  }
+
+  if (typeof cachedTokens === "number") {
+    totals.cached_input_tokens = (totals.cached_input_tokens ?? 0) + cachedTokens;
   }
 }
 
@@ -1048,6 +1053,11 @@ function buildStreamStats(usage, timings) {
     ? Math.max((timings.firstDeltaAtMs - timings.streamStartedAtMs) / 1000, 0)
     : null;
   const promptPerSecond = derivePromptPerSecond(inputTokens, timeToFirstTokenSeconds);
+  // Prefix-cache telemetry: llama.cpp and OpenAI-compatible endpoints report how
+  // many prompt tokens were served from the KV cache. A cache miss reads as 0,
+  // a provider that never reports it as null — the two must stay distinguishable.
+  const cachedInputTokens = firstFiniteNumber(
+    usage?.cached_input_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cached_tokens);
 
   const stats = {
     input_tokens: inputTokens,
@@ -1055,6 +1065,7 @@ function buildStreamStats(usage, timings) {
     tokens_per_second: tokensPerSecond,
     time_to_first_token_seconds: timeToFirstTokenSeconds,
     prompt_per_second: promptPerSecond,
+    cached_input_tokens: cachedInputTokens,
   };
 
   return Object.values(stats).some(value => value !== null) ? stats : null;

@@ -1,5 +1,9 @@
 const { TextDecoder } = require("node:util");
 
+// Delta windows shorter than this are frame-coalescing noise, not a measurable
+// decode rate; tokens_per_second is left null for them instead of reporting noise.
+const MIN_DECODE_WINDOW_MS = 10;
+
 const { LmStudioClient } = require("./lm-studio-client");
 const { relayLmStudioStream } = require("./lm-studio-stream");
 const { getActiveProviderId, getProviderConnectionSettings, getProviderDefinition } = require("./provider-config");
@@ -154,10 +158,15 @@ class ProviderClient {
   }
 
   async streamOpenAiCompatibleChat(connection, request, signal, onEvent) {
+    const streamStartedAtMs = Date.now();
+    let firstDeltaAtMs = null;
+    let lastDeltaAtMs = null;
+
     const response = await this.sendJson(connection, "POST", "chat/completions", {
       model: request.model,
       messages: buildOpenAiMessages(request.messages, request.systemPrompt),
       stream: true,
+      stream_options: { include_usage: true },
       temperature: request.temperature ?? undefined,
       top_p: request.topP ?? undefined,
     }, {
@@ -196,6 +205,12 @@ class ProviderClient {
       const reasoningDelta = normalizeOpenAiDelta(delta.reasoning_content ?? delta.reasoning ?? delta.reasoningContent ?? null);
       const contentDelta = normalizeOpenAiDelta(delta.content);
 
+      if (reasoningDelta || contentDelta) {
+        const deltaAtMs = Date.now();
+        firstDeltaAtMs = firstDeltaAtMs ?? deltaAtMs;
+        lastDeltaAtMs = deltaAtMs;
+      }
+
       if (reasoningDelta) {
         reasoning.push(reasoningDelta);
         await onEvent("reasoning.delta", JSON.stringify({ content: reasoningDelta }));
@@ -214,6 +229,7 @@ class ProviderClient {
       reasoning: reasoning.join(""),
       content: message.join(""),
       usage,
+      timings: { streamStartedAtMs, firstDeltaAtMs, lastDeltaAtMs },
     });
   }
 
@@ -818,17 +834,58 @@ function buildFinalResponse(options) {
 
   return {
     output,
-    stats: options.usage
-      ? {
-          input_tokens: options.usage.input_tokens ?? null,
-          total_output_tokens: options.usage.output_tokens ?? null,
-        }
-      : null,
+    stats: buildStreamStats(options.usage, options.timings),
     response_id: options.responseId || null,
     model_info: {
       context_length: options.contextLength ?? null,
     },
   };
+}
+
+// Decode speed mirrors the LM Studio stats semantics: output tokens divided by the
+// token-generation window (first delta to last delta), so prompt processing and
+// time-to-first-token are excluded. When a provider omits usage, the token counts
+// and tokens_per_second stay null rather than being estimated.
+function buildStreamStats(usage, timings) {
+  if (!usage && !timings) {
+    return null;
+  }
+
+  const inputTokens = firstFiniteNumber(usage?.input_tokens ?? usage?.prompt_tokens);
+  const outputTokens = firstFiniteNumber(usage?.output_tokens ?? usage?.completion_tokens);
+  const decodeSeconds = timings && typeof timings.firstDeltaAtMs === "number" && timings.lastDeltaAtMs > timings.firstDeltaAtMs + MIN_DECODE_WINDOW_MS
+    ? (timings.lastDeltaAtMs - timings.firstDeltaAtMs) / 1000
+    : null;
+  const tokensPerSecond = typeof outputTokens === "number" && outputTokens > 0 && typeof decodeSeconds === "number" && decodeSeconds > 0
+    ? outputTokens / decodeSeconds
+    : null;
+  const timeToFirstTokenSeconds = timings && typeof timings.firstDeltaAtMs === "number" && typeof timings.streamStartedAtMs === "number"
+    ? Math.max((timings.firstDeltaAtMs - timings.streamStartedAtMs) / 1000, 0)
+    : null;
+
+  const stats = {
+    input_tokens: inputTokens,
+    total_output_tokens: outputTokens,
+    tokens_per_second: tokensPerSecond,
+    time_to_first_token_seconds: timeToFirstTokenSeconds,
+  };
+
+  return Object.values(stats).some(value => value !== null) ? stats : null;
+}
+
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+
+  return null;
 }
 
 function buildAdaptiveMemoryPrompt(options) {

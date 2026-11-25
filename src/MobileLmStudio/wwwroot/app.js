@@ -689,7 +689,7 @@ function activeProviderSupportsMcp() {
 }
 
 function activeProviderLikelyNeedsApiKey() {
-  return !["lmstudio", "ollama", "llama-cpp", "hermes-agent"].includes(String(state.activeProvider || "").toLowerCase());
+  return !["lmstudio", "hermes-agent"].includes(String(state.activeProvider || "").toLowerCase());
 }
 
 async function loadAuthenticatedData() {

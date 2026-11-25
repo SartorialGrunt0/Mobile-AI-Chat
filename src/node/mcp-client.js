@@ -20,33 +20,66 @@ async function listTools(server, signal = null) {
   const tools = [];
   let cursor = null;
 
-  for (let page = 0; page < MCP_MAX_TOOL_PAGES; page += 1) {
-    const result = await rpcRequest(server, session, "tools/list", cursor ? { cursor } : {}, signal);
-    for (const tool of Array.isArray(result?.tools) ? result.tools : []) {
-      if (tool && typeof tool.name === "string" && tool.name) {
-        tools.push({
-          name: tool.name,
-          description: String(tool.description || ""),
-          inputSchema: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object", properties: {} },
-        });
+  try {
+    for (let page = 0; page < MCP_MAX_TOOL_PAGES; page += 1) {
+      const result = await rpcRequest(server, session, "tools/list", cursor ? { cursor } : {}, signal);
+      for (const tool of Array.isArray(result?.tools) ? result.tools : []) {
+        if (tool && typeof tool.name === "string" && tool.name) {
+          tools.push({
+            name: tool.name,
+            description: String(tool.description || ""),
+            inputSchema: tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : { type: "object", properties: {} },
+          });
+        }
+      }
+
+      cursor = result?.nextCursor || null;
+      if (!cursor) {
+        break;
       }
     }
-
-    cursor = result?.nextCursor || null;
-    if (!cursor) {
-      break;
-    }
+  } finally {
+    await terminateSession(server, session, signal);
   }
 
   return tools;
 }
 
+async function terminateSession(server, session, signal) {
+  // Best-effort teardown for stateful Streamable HTTP servers, which keep a
+  // session (and its SSE stream) open until told otherwise. A 405 here simply
+  // means the server does not support explicit termination.
+  if (!session?.sessionId || !server?.Url) {
+    return;
+  }
+
+  try {
+    const headers = { "Mcp-Session-Id": session.sessionId };
+    if (server.Token) {
+      headers.Authorization = `Bearer ${server.Token}`;
+    }
+
+    const response = await fetch(server.Url, {
+      method: "DELETE",
+      headers,
+      signal: composeSignal(signal),
+    });
+    await response.text().catch(() => "");
+  } catch {
+  }
+}
+
 async function callTool(server, toolName, args, signal = null) {
   const session = await openSession(server, signal);
-  const result = await rpcRequest(server, session, "tools/call", {
-    name: toolName,
-    arguments: args && typeof args === "object" ? args : {},
-  }, signal);
+  let result;
+  try {
+    result = await rpcRequest(server, session, "tools/call", {
+      name: toolName,
+      arguments: args && typeof args === "object" ? args : {},
+    }, signal);
+  } finally {
+    await terminateSession(server, session, signal);
+  }
 
   const text = extractResultText(result);
   if (result?.isError === true) {
@@ -55,7 +88,6 @@ async function callTool(server, toolName, args, signal = null) {
 
   return text;
 }
-
 async function probeServer(server, signal = null) {
   const tools = await listTools(server, signal);
   return { ok: true, toolCount: tools.length };
@@ -146,7 +178,7 @@ async function readJsonRpcResponse(response, expectedId, server) {
   const contentType = String(response.headers.get("content-type") || "").toLowerCase();
 
   if (contentType.includes("text/event-stream")) {
-    return await readJsonRpcFromSse(response.body, expectedId);
+    return await readJsonRpcFromSse(response.body, expectedId, server?.Label);
   }
 
   const text = await response.text();
@@ -168,50 +200,78 @@ async function readJsonRpcResponse(response, expectedId, server) {
   return parsed;
 }
 
-async function readJsonRpcFromSse(sourceStream, expectedId) {
+async function readJsonRpcFromSse(sourceStream, expectedId, serverLabel = "MCP server") {
   const reader = sourceStream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let found = null;
 
-  while (!found) {
-    const { value, done } = await reader.read();
-    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-    buffer = buffer.replace(/\r/g, "");
+  try {
+    while (!found) {
+      const { value, done } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r/g, "");
 
-    let boundaryIndex = buffer.indexOf("\n\n");
-    while (boundaryIndex >= 0) {
-      const frame = buffer.slice(0, boundaryIndex);
-      buffer = buffer.slice(boundaryIndex + 2);
+      let boundaryIndex = buffer.indexOf("\n\n");
+      while (boundaryIndex >= 0) {
+        const frame = buffer.slice(0, boundaryIndex);
+        buffer = buffer.slice(boundaryIndex + 2);
 
-      for (const line of frame.split("\n")) {
-        if (!line.toLowerCase().startsWith("data:")) {
-          continue;
-        }
-
-        const payload = line.slice(5).trim();
-        if (!payload) {
-          continue;
-        }
-
-        try {
-          const parsed = JSON.parse(payload);
-          if (parsed?.id === expectedId) {
-            found = parsed;
+        for (const line of frame.split("\n")) {
+          if (!line.toLowerCase().startsWith("data:")) {
+            continue;
           }
-        } catch {
+
+          const payload = line.slice(5).trim();
+          if (!payload) {
+            continue;
+          }
+
+          try {
+            const parsed = JSON.parse(payload);
+            const candidate = Array.isArray(parsed)
+              ? parsed.find(entry => jsonRpcIdMatches(entry?.id, expectedId)) || null
+              : (jsonRpcIdMatches(parsed?.id, expectedId) ? parsed : null);
+            if (candidate) {
+              found = candidate;
+            }
+          } catch {
+          }
         }
+
+        boundaryIndex = buffer.indexOf("\n\n");
       }
 
-      boundaryIndex = buffer.indexOf("\n\n");
+      if (done) {
+        break;
+      }
     }
-
-    if (done) {
-      break;
+  } finally {
+    // Stateful servers keep the SSE response open after the reply; cancelling
+    // the reader releases the socket instead of parking it.
+    try {
+      await reader.cancel();
+    } catch {
     }
   }
 
+  if (!found) {
+    // A stream that ends (or never carries) the matching response must NOT
+    // read as a silent success with an empty result.
+    throw new McpClientError(`MCP server "${serverLabel}" sent no response to request ${expectedId} before the stream ended.`);
+  }
+
   return found;
+}
+
+function jsonRpcIdMatches(actualId, expectedId) {
+  // JSON-RPC ids may legitimately be strings or numbers; servers are allowed
+  // to echo the id in either form.
+  if (actualId === undefined || actualId === null) {
+    return false;
+  }
+
+  return actualId === expectedId || String(actualId) === String(expectedId);
 }
 
 async function readErrorDetail(response) {

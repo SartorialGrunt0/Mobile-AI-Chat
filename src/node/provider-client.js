@@ -1,4 +1,5 @@
 const { TextDecoder } = require("node:util");
+const { fetchWithHeadersTimeout, readWithIdleTimeout } = require("./fetch-timeout");
 
 // Delta windows shorter than this are frame-coalescing noise, not a measurable
 // decode rate; tokens_per_second is left null for them instead of reporting noise.
@@ -166,13 +167,9 @@ class ProviderClient {
 
     const streamStartedAtMs = Date.now();
     let firstDeltaAtMs = null;
-    let lastDeltaAtMs = null;
-
-    const markDeltaTiming = () => {
-      const deltaAtMs = Date.now();
-      firstDeltaAtMs = firstDeltaAtMs ?? deltaAtMs;
-      lastDeltaAtMs = deltaAtMs;
-    };
+    // Decode time is summed PER ROUND so MCP tool execution wall-clock and
+    // per-round request latency are excluded from tokens_per_second.
+    let decodeActiveMs = 0;
 
     const messages = buildOpenAiMessages(request.messages, request.systemPrompt);
     const usageTotals = { input_tokens: null, output_tokens: null, cached_input_tokens: null };
@@ -186,7 +183,20 @@ class ProviderClient {
         throw createAbortError();
       }
 
+      const roundTiming = { first: null, last: null };
+      const markDeltaTiming = () => {
+        const deltaAtMs = Date.now();
+        if (roundTiming.first === null) {
+          roundTiming.first = deltaAtMs;
+        }
+        roundTiming.last = deltaAtMs;
+      };
+
       const roundResult = await streamSingleRound(this, connection, request, messages, toolRegistry, round === 0, signal, onEvent, markDeltaTiming);
+      if (roundTiming.first !== null) {
+        firstDeltaAtMs = firstDeltaAtMs ?? roundTiming.first;
+        decodeActiveMs += Math.max(roundTiming.last - roundTiming.first, 0);
+      }
       responseId = roundResult.responseId || responseId;
       accumulateUsage(usageTotals, roundResult.usage);
       reasoningParts.push(roundResult.reasoning);
@@ -211,10 +221,20 @@ class ProviderClient {
       });
 
       for (const entry of roundResult.toolCalls) {
-        const resolved = toolRegistry.resolve(entry.name);
-        await onEvent("tool_call.start", JSON.stringify({ tool: resolved.displayName }));
+        const resolved = toolRegistry ? toolRegistry.resolve(entry.name) : null;
+        await onEvent("tool_call.start", JSON.stringify({ tool: resolved ? resolved.displayName : entry.name }));
 
-        const parsedArguments = safeParseJson(entry.arguments || "{}") || {};
+        const parsedArguments = entry.arguments ? safeParseJson(entry.arguments) : {};
+        if (!parsedArguments || typeof parsedArguments !== "object") {
+          // Truncated/garbled streamed arguments: do NOT execute the tool with
+          // an empty object — report it so the model can retry (mirrors the
+          // LM Studio path's invalid_tool_call handling).
+          const invalidArgumentsFailure = "The model produced invalid tool arguments; the tool was not executed. Retry with complete, valid JSON arguments.";
+          await onEvent("tool_call.failure", JSON.stringify({ output: invalidArgumentsFailure }));
+          toolCallRecords.push({ tool: resolved?.displayName || entry.name, arguments: {}, output: invalidArgumentsFailure });
+          messages.push({ role: "tool", tool_call_id: entry.id, content: invalidArgumentsFailure });
+          continue;
+        }
         await onEvent("tool_call.arguments", JSON.stringify({ arguments: parsedArguments }));
 
         let toolOutput;
@@ -224,6 +244,10 @@ class ProviderClient {
             : `Unknown tool ${entry.name}.`;
           await onEvent("tool_call.success", JSON.stringify({ output: toolOutput }));
         } catch (error) {
+          if (error?.name === "AbortError" || signal?.aborted) {
+            // A user-initiated stop must propagate, not surface as a tool failure.
+            throw error;
+          }
           toolOutput = `Tool call failed: ${error.message}`;
           await onEvent("tool_call.failure", JSON.stringify({ output: toolOutput }));
         }
@@ -241,7 +265,7 @@ class ProviderClient {
       content: contentParts.filter(Boolean).join("\n"),
       usage: usageTotals,
       toolCalls: toolCallRecords,
-      timings: { streamStartedAtMs, firstDeltaAtMs, lastDeltaAtMs },
+      timings: { streamStartedAtMs, firstDeltaAtMs, decodeActiveMs },
     });
   }
 
@@ -459,7 +483,7 @@ class ProviderClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const response = await fetch(url, {
+    const response = await fetchWithHeadersTimeout(url, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(stripUndefined(body)),
@@ -512,7 +536,7 @@ async function consumeSseStream(sourceStream, onFrame) {
   let dataLines = [];
 
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await readWithIdleTimeout(reader);
     buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
     buffer = buffer.replace(/\r/g, "");
 
@@ -886,7 +910,7 @@ async function streamSingleRound(providerClient, connection, request, messages, 
     const reasoningDelta = normalizeOpenAiDelta(delta.reasoning_content ?? delta.reasoning ?? delta.reasoningContent ?? null);
     const contentDelta = normalizeOpenAiDelta(delta.content);
 
-    if (reasoningDelta || contentDelta) {
+    if (reasoningDelta || contentDelta || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0)) {
       markDeltaTiming();
     }
 
@@ -1043,9 +1067,11 @@ function buildStreamStats(usage, timings) {
 
   const inputTokens = firstFiniteNumber(usage?.input_tokens ?? usage?.prompt_tokens);
   const outputTokens = firstFiniteNumber(usage?.output_tokens ?? usage?.completion_tokens);
-  const decodeSeconds = timings && typeof timings.firstDeltaAtMs === "number" && timings.lastDeltaAtMs > timings.firstDeltaAtMs + MIN_DECODE_WINDOW_MS
-    ? (timings.lastDeltaAtMs - timings.firstDeltaAtMs) / 1000
-    : null;
+  const decodeSeconds = timings && typeof timings.decodeActiveMs === "number"
+    ? timings.decodeActiveMs / 1000
+    : timings && typeof timings.firstDeltaAtMs === "number" && timings.lastDeltaAtMs > timings.firstDeltaAtMs + MIN_DECODE_WINDOW_MS
+      ? (timings.lastDeltaAtMs - timings.firstDeltaAtMs) / 1000
+      : null;
   const tokensPerSecond = typeof outputTokens === "number" && outputTokens > 0 && typeof decodeSeconds === "number" && decodeSeconds > 0
     ? outputTokens / decodeSeconds
     : null;

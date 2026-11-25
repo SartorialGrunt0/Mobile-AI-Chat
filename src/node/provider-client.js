@@ -668,6 +668,14 @@ function mergeUsage(current, next) {
   };
 }
 
+// llama.cpp and LM Studio's server accept these non-standard sampling extensions
+// on their OpenAI-compatible endpoint. Strict servers never see them: each field
+// is omitted unless the user explicitly set a value.
+function reasoningEffortField(value) {
+  const effort = String(value || "").trim().toLowerCase();
+  return effort && !["default", "off", "none"].includes(effort) ? { reasoning_effort: effort } : {};
+}
+
 // One streamed round-trip of the OpenAI-compatible tool loop. Deltas for text and
 // reasoning are relayed live; tool_calls deltas are fragments that must be
 // accumulated by index (the spec streams name and argument pieces separately).
@@ -679,6 +687,10 @@ async function streamSingleRound(providerClient, connection, request, messages, 
     stream_options: { include_usage: true },
     temperature: request.temperature ?? undefined,
     top_p: request.topP ?? undefined,
+    top_k: request.topK ?? undefined,
+    min_p: request.minP ?? undefined,
+    repeat_penalty: request.repeatPenalty ?? undefined,
+    ...reasoningEffortField(request.reasoning),
     ...(toolRegistry && toolRegistry.tools.length > 0 ? { tools: toolRegistry.tools } : {}),
   }, {
     acceptEventStream: true,

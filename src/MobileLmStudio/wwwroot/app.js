@@ -35,6 +35,9 @@ const state = {
   statusText: "Ready",
   statusTone: "neutral",
   isSending: false,
+  // Mid-stream sends become the next turn: chatId -> [{id, content, attachments, createdAt}].
+  // Intentionally in-memory only — a reload drops queued items.
+  messageQueues: new Map(),
   isModelLoading: false,
   isDictating: false,
   speechRecognition: null,
@@ -98,6 +101,7 @@ const elements = {
   unloadModelButton: document.getElementById("unload-model-button"),
   modelLoadActions: document.getElementById("model-load-actions"),
   contextLengthInput: document.getElementById("context-length-input"),
+  contextRemoteNote: document.getElementById("context-remote-note"),
   temperatureInput: document.getElementById("temperature-input"),
   topKInput: document.getElementById("top-k-input"),
   topPInput: document.getElementById("top-p-input"),
@@ -354,6 +358,12 @@ function bindEvents() {
   });
 
   elements.messageList.addEventListener("click", event => {
+    const queuedRemove = event.target.closest("button[data-queued-remove]");
+    if (queuedRemove?.dataset.queuedRemove) {
+      removeQueuedMessage(queuedRemove.dataset.queuedRemove);
+      return;
+    }
+
     const retryButton = event.target.closest("button[data-retry-chat]");
     if (retryButton) {
       void retryLatestPrompt();
@@ -582,7 +592,9 @@ function bindEvents() {
   });
 
   elements.sendButton.addEventListener("click", event => {
-    if (isCurrentChatActivelyStreaming()) {
+    // Stop only when there is nothing to queue; with content, the click falls
+    // through to form submit -> sendMessage(), which queues mid-stream.
+    if (isCurrentChatActivelyStreaming() && !composerHasContent()) {
       event.preventDefault();
       stopStream();
     }
@@ -637,7 +649,10 @@ function bindEvents() {
     renderSettingsMcpServers();
   });
 
-  elements.messageInput.addEventListener("input", autoResizeComposer);
+  elements.messageInput.addEventListener("input", () => {
+    autoResizeComposer();
+    refreshSendButtonState();
+  });
   elements.messageInput.addEventListener("keydown", event => {
     if (event.key === "Enter" && !event.shiftKey) {
       if (state.enterKeyBehavior !== "newline") {
@@ -976,6 +991,11 @@ async function openChat(chatId, suppressStatus = false) {
       } catch { }
     }
 
+    if (!state.streamingChatIds.has(chatId) && state.serverStreamPollChatId !== chatId) {
+      // Returning to a chat with a pending queue resumes draining it.
+      void maybeFlushMessageQueue(chatId);
+    }
+
     if (!suppressStatus) {
       setStatus(`Opened ${state.currentChat.title}.`, "neutral");
     }
@@ -1124,20 +1144,42 @@ async function refreshChats() {
   renderChatList();
 }
 
-async function sendMessage() {
+async function sendMessage(options = {}) {
+  // options.input/attachments override the composer (queue flush sends); composer
+  // sends read the DOM as before. Returns true only when a stream actually started.
+  const input = typeof options.input === "string" ? options.input : elements.messageInput.value.trim();
+  const attachments = options.attachments ?? cloneAttachments(state.composerAttachments);
+
   if (isCurrentChatActivelyStreaming()) {
-    return;
+    // Mid-stream input used to vanish silently here. It now becomes the next turn.
+    if (!input && attachments.length === 0) {
+      return false;
+    }
+    getOrCreateMessageQueue(currentMessageQueueKey()).push({
+      id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      content: input,
+      attachments,
+      createdAt: new Date().toISOString(),
+    });
+    if (!options.fromFlush) {
+      elements.messageInput.value = "";
+      state.composerAttachments = [];
+      renderComposerAttachments();
+      autoResizeComposer();
+      setStatus("Queued — will send after this reply.", "neutral");
+      renderMessages();
+      refreshSendButtonState();
+    }
+    return false;
   }
 
-  const input = elements.messageInput.value.trim();
-  const attachments = cloneAttachments(state.composerAttachments);
   if (!input && attachments.length === 0) {
-    return;
+    return false;
   }
 
   if (!resolveActiveChatRequestSettings().modelKey) {
     setStatus("Choose a model first.", "error");
-    return;
+    return false;
   }
 
   const requestBody = buildChatRequestBody({ chatId: state.currentChatId, input, attachments });
@@ -1192,9 +1234,12 @@ async function sendMessage() {
   state.stickToBottom = state.autoScrollEnabled;
   state.streamingChatIds.add(state.currentChatId);
   initializePendingUsageEstimate(pendingAssistant);
-  elements.messageInput.value = "";
-  state.composerAttachments = [];
-  autoResizeComposer();
+  if (!options.fromFlush) {
+    // A flush send must not clobber text the user is typing while the queue drains.
+    elements.messageInput.value = "";
+    state.composerAttachments = [];
+    autoResizeComposer();
+  }
   setStatus(`Waiting for ${getActiveProviderLabel()}...`, "busy");
   render();
 
@@ -1237,6 +1282,13 @@ async function sendMessage() {
       state.streamingChatIds.add(newChatId);
       state.streamControllers.set(newChatId, streamController);
       chatIdForStream = newChatId;
+      // Draft chats had no id to key queued sends under; adopt them now the
+      // chat exists so the flush at stream end can find its items.
+      const draftQueue = state.messageQueues.get(PENDING_CHAT_QUEUE_KEY);
+      if (draftQueue && draftQueue.length > 0) {
+        state.messageQueues.delete(PENDING_CHAT_QUEUE_KEY);
+        state.messageQueues.set(newChatId, [...draftQueue, ...(state.messageQueues.get(newChatId) || [])]);
+      }
     }
 
     if (state.draftStopRequested) {
@@ -1269,6 +1321,7 @@ async function sendMessage() {
     }
 
     setStatus("Response complete.", "neutral");
+    return true;
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
@@ -1300,6 +1353,10 @@ async function sendMessage() {
     }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
+    if (chatIdForStream) {
+      // The turn is over (completed, stopped, or failed) — the queue drains.
+      void maybeFlushMessageQueue(chatIdForStream);
+    }
   }
 }
 
@@ -1546,8 +1603,12 @@ function renderControls() {
   const isActive = isCurrentChatActivelyStreaming();
   renderModelControlValidation();
   renderSendButton(locked, isActive);
-  elements.messageInput.disabled = isActive || locked;
-  elements.attachButton.disabled = isActive || locked;
+  // The composer stays live during a stream so a mid-stream send can be queued.
+  elements.messageInput.disabled = Boolean(locked);
+  elements.attachButton.disabled = Boolean(locked);
+  if (elements.contextRemoteNote) {
+    elements.contextRemoteNote.hidden = activeProviderSupportsModelLoad();
+  }
   if (elements.modelResetButton) {
     elements.modelResetButton.disabled = locked;
   }
@@ -1783,7 +1844,7 @@ function renderMessages(forceScroll = false) {
   const openDetailsStates = captureOpenDetails();
   elements.messageScroll.classList.toggle("empty", !hasMessages);
   elements.emptyState.hidden = hasMessages;
-  elements.messageList.innerHTML = hasMessages ? messages.map(renderMessageCard).join("") : "";
+  elements.messageList.innerHTML = [...messages.map(renderMessageCard), ...currentQueuedMessages().map(renderQueuedMessageCard)].join("");
   restoreOpenDetails(openDetailsStates);
   renderMathInMarkdown(elements.messageList);
 
@@ -2584,6 +2645,23 @@ function renderComposerAttachments() {
         <button type="button" class="ghost-button attachment-remove-button" data-remove-attachment-index="${index}">Remove</button>
       </article>`)
     .join("");
+  refreshSendButtonState();
+}
+
+function renderQueuedMessageCard(item) {
+  return `
+    <article class="message-card user queued-message-card">
+      <div class="message-head">
+        <span class="message-role">Queued</span>
+        <time class="message-time">${escapeHtml(formatClock(item.createdAt))}</time>
+      </div>
+      ${item.attachments?.length ? `<div class="attachment-list">${item.attachments.map(renderMessageAttachment).join("")}</div>` : ""}
+      <div class="message-body">${escapeHtml(item.content)}</div>
+      <div class="message-actions">
+        <span class="queued-hint">Sends after the current reply</span>
+        <button type="button" class="ghost-button" data-queued-remove="${escapeAttribute(item.id)}" title="Remove queued message" aria-label="Remove queued message">Remove</button>
+      </div>
+    </article>`;
 }
 
 function renderMessageAttachment(attachment) {
@@ -3271,14 +3349,22 @@ function renderChatToolsButton() {
 }
 
 function renderSendButton(locked, isActive) {
-  const label = isActive ? "Stop response" : "Send message";
+  // While streaming: empty composer = Stop; text/attachments typed = queue this send.
+  const queueMode = isActive && composerHasContent();
+  const label = !isActive ? "Send message" : queueMode ? "Queue message (sends after reply)" : "Stop response";
   const activeModelKey = resolveActiveChatRequestSettings().modelKey;
-  setButtonIcon(elements.sendButton, isActive ? "stop" : "send");
+  setButtonIcon(elements.sendButton, isActive && !queueMode ? "stop" : "send");
   elements.sendButton.title = label;
   elements.sendButton.setAttribute("aria-label", label);
-  elements.sendButton.disabled = isActive ? false : locked || !activeModelKey;
-  elements.sendButton.classList.toggle("danger-button", isActive);
-  elements.sendButton.classList.toggle("primary-button", !isActive);
+  // Queueing needs no model check now — the flush resolves settings at send time
+  // and re-queues (with a status) if a model is still missing then.
+  elements.sendButton.disabled = locked || (!isActive && !activeModelKey);
+  elements.sendButton.classList.toggle("danger-button", isActive && !queueMode);
+  elements.sendButton.classList.toggle("primary-button", !isActive || queueMode);
+}
+
+function refreshSendButtonState() {
+  renderSendButton(!state.bootstrap?.authenticated && state.bootstrap?.requireLogin, isCurrentChatActivelyStreaming());
 }
 
 function openChatOverrideMenu() {
@@ -3747,6 +3833,7 @@ async function retryLatestPrompt() {
     }
 
     setStatus("Response complete.", "neutral");
+    return true;
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
@@ -3778,6 +3865,10 @@ async function retryLatestPrompt() {
     }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
+    if (chatIdForStream) {
+      // The turn is over (completed, stopped, or failed) — the queue drains.
+      void maybeFlushMessageQueue(chatIdForStream);
+    }
   }
 }
 
@@ -4062,6 +4153,7 @@ async function saveAndRegenerateMessage(messageId, newContent) {
     }
 
     setStatus("Response complete.", "neutral");
+    return true;
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
@@ -4091,6 +4183,10 @@ async function saveAndRegenerateMessage(messageId, newContent) {
     }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
+    if (chatIdForStream) {
+      // The turn is over (completed, stopped, or failed) — the queue drains.
+      void maybeFlushMessageQueue(chatIdForStream);
+    }
   }
 }
 
@@ -5484,6 +5580,70 @@ function isCurrentChatActivelyStreaming() {
          (chatId !== null && state.serverStreamPollChatId === chatId);
 }
 
+const PENDING_CHAT_QUEUE_KEY = "__pending_chat__";
+
+function composerHasContent() {
+  return Boolean(elements.messageInput.value.trim()) || state.composerAttachments.length > 0;
+}
+
+function currentMessageQueueKey() {
+  return state.currentChatId || state.currentStreamChatId || PENDING_CHAT_QUEUE_KEY;
+}
+
+function currentQueuedMessages() {
+  return state.messageQueues.get(currentMessageQueueKey()) || [];
+}
+
+function getOrCreateMessageQueue(chatId) {
+  let queue = state.messageQueues.get(chatId);
+  if (!queue) {
+    queue = [];
+    state.messageQueues.set(chatId, queue);
+  }
+  return queue;
+}
+
+function removeQueuedMessage(queueId) {
+  for (const [chatId, queue] of state.messageQueues) {
+    const index = queue.findIndex(item => item.id === queueId);
+    if (index !== -1) {
+      queue.splice(index, 1);
+      if (queue.length === 0) {
+        state.messageQueues.delete(chatId);
+      }
+      break;
+    }
+  }
+  render();
+}
+
+// Drain one queued item per finished turn, only while the queued chat is the
+// open one (the next item's send chains another flush from its own teardown).
+async function maybeFlushMessageQueue(chatId) {
+  const queue = chatId ? state.messageQueues.get(chatId) : null;
+  if (!queue || queue.length === 0) {
+    return;
+  }
+  if (chatId !== state.currentChatId || isCurrentChatActivelyStreaming()) {
+    return;
+  }
+
+  const item = queue.shift();
+  if (queue.length === 0) {
+    state.messageQueues.delete(chatId);
+  }
+
+  const started = await sendMessage({ input: item.content, attachments: item.attachments, fromFlush: true });
+  if (!started && item.content) {
+    // Never reached the provider (no model selected, or a stream raced in) —
+    // put the item back at the front so nothing is silently lost.
+    const requeue = state.messageQueues.get(chatId) || [];
+    requeue.unshift(item);
+    state.messageQueues.set(chatId, requeue);
+    render();
+  }
+}
+
 function stopStream() {
   const chatId = state.currentChatId;
   const controller = state.streamControllers.get(chatId);
@@ -5502,7 +5662,9 @@ function stopStream() {
   }
   if (chatId && state.serverStreamPollChatId === chatId) {
     stopStreamWaitPolling();
-    fetch(`/api/chats/${encodeURIComponent(chatId)}/stop`, { method: "POST", credentials: "same-origin" }).catch(() => {});
+    fetch(`/api/chats/${encodeURIComponent(chatId)}/stop`, { method: "POST", credentials: "same-origin" })
+      .catch(() => {})
+      .then(() => void maybeFlushMessageQueue(chatId));
     if (state.currentChat?.messages) {
       state.currentChat.messages = state.currentChat.messages.filter(m => m.id !== "stream-pending-placeholder");
     }
@@ -5561,6 +5723,7 @@ function startStreamWaitPolling(chatId) {
           syncMessageScroll(true);
         }
         setStatus(hasNewMessage ? "Response complete." : "Ready", "neutral");
+        void maybeFlushMessageQueue(chatId);
       }
     } catch {
     }

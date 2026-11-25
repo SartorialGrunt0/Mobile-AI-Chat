@@ -662,10 +662,20 @@ function mapCompatibleModel(model, definition) {
     quantization: null,
     sizeBytes: null,
     paramsString: null,
-    // vLLM exposes max_model_len on /v1/models; other servers may report
-    // context under different keys. Null means "unknown" — the UI then falls
-    // back to the /props probe below or the manual field.
-    maxContextLength: toPositiveInt(model?.max_model_len ?? model?.max_context_length ?? model?.context_length),
+    // Priority order for the server-reported context window:
+    // 1. vLLM max_model_len (engine-enforced configured value).
+    // 2. llama.cpp router per-model launch config (--ctx-size in status.args) —
+    //    the value the server will actually run the model with.
+    // 3. catalog fields (max_context_length / context_length) — these are the
+    //    model's TRAIN context (spec sheet), which can exceed the configured
+    //    value (e.g. qwen3.8-27b: trained 262k, router runs it at 85k).
+    // Null means "unknown" — the UI then falls back to the /props probe or the manual field.
+    maxContextLength: toPositiveInt(
+      model?.max_model_len
+        ?? routerLaunchContextSize(model)
+        ?? model?.max_context_length
+        ?? model?.context_length,
+    ),
     format: null,
     loadedInstances: [],
     capabilities: {
@@ -677,6 +687,16 @@ function mapCompatibleModel(model, definition) {
     selectedVariant: null,
     description: String(model?.description || "").trim() || null,
   };
+}
+
+function routerLaunchContextSize(model) {
+  // llama.cpp router /v1/models entries carry the instance launch args;
+  // --ctx-size is the configured window, authoritative over the model's
+  // train-context context_length field on the same entry.
+  const args = model?.status?.args;
+  if (!Array.isArray(args)) return null;
+  const index = args.findIndex(arg => arg === "--ctx-size" || arg === "--ctx_size" || arg === "-c");
+  return index >= 0 ? args[index + 1] : null;
 }
 
 function toPositiveInt(value) {

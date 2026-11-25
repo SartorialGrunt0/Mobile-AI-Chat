@@ -101,7 +101,6 @@ const elements = {
   unloadModelButton: document.getElementById("unload-model-button"),
   modelLoadActions: document.getElementById("model-load-actions"),
   contextLengthInput: document.getElementById("context-length-input"),
-  contextRemoteNote: document.getElementById("context-remote-note"),
   temperatureInput: document.getElementById("temperature-input"),
   topKInput: document.getElementById("top-k-input"),
   topPInput: document.getElementById("top-p-input"),
@@ -1612,9 +1611,12 @@ function renderControls() {
   // The composer stays live during a stream so a mid-stream send can be queued.
   elements.messageInput.disabled = Boolean(locked);
   elements.attachButton.disabled = Boolean(locked);
-  if (elements.contextRemoteNote) {
-    elements.contextRemoteNote.hidden = activeProviderSupportsModelLoad();
-  }
+  // A provider-reported context is server-configured: grey the field out
+  // rather than explaining it in a note. When the server reports nothing,
+  // the field stays editable as the token-meter's manual denominator.
+  const contextServerManaged = !activeProviderSupportsModelLoad() && Number.isFinite(resolveModelContextLimit(findSelectedModel()));
+  elements.contextLengthInput.disabled = Boolean(locked) || contextServerManaged;
+  elements.contextLengthInput.classList.toggle("field-locked", contextServerManaged);
   if (elements.modelResetButton) {
     elements.modelResetButton.disabled = locked;
   }

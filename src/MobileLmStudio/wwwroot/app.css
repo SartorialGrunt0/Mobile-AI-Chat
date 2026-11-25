@@ -2002,3 +2002,13 @@ body.drawer-open .drawer-backdrop {
   font-size: 12px;
   opacity: 0.8;
 }
+
+/* Server-reported context: read-only display, greyed to signal "configured
+   on the server". Kept legible (not iOS-washed) via explicit text fill. */
+.field-locked:disabled {
+  opacity: 1;
+  cursor: not-allowed;
+  background: var(--panel);
+  color: var(--muted);
+  -webkit-text-fill-color: var(--muted);
+}

@@ -284,6 +284,25 @@ class ProviderClient {
       ? payload.data.map(model => mapCompatibleModel(model, connection.definition))
       : [];
 
+    // Servers whose /models omits context (llama.cpp) report it on /props.
+    // Routers answer with n_ctx 0, so only a positive value counts; a missing
+    // endpoint just means we fall back to the manual field.
+    if (models.length > 0 && models.every(model => model.maxContextLength === null)) {
+      let propsContext = null;
+      try {
+        const propsResponse = await this.sendJson(connection, "GET", "../props", undefined, { allowFailure: true });
+        const props = propsResponse.ok ? await propsResponse.json().catch(() => null) : null;
+        propsContext = toPositiveInt(props?.default_generation_settings?.n_ctx);
+      } catch {
+        propsContext = null;
+      }
+      if (propsContext) {
+        for (const model of models) {
+          model.maxContextLength = propsContext;
+        }
+      }
+    }
+
     return { models };
   }
 
@@ -643,7 +662,10 @@ function mapCompatibleModel(model, definition) {
     quantization: null,
     sizeBytes: null,
     paramsString: null,
-    maxContextLength: null,
+    // vLLM exposes max_model_len on /v1/models; other servers may report
+    // context under different keys. Null means "unknown" — the UI then falls
+    // back to the /props probe below or the manual field.
+    maxContextLength: toPositiveInt(model?.max_model_len ?? model?.max_context_length ?? model?.context_length),
     format: null,
     loadedInstances: [],
     capabilities: {
@@ -655,6 +677,11 @@ function mapCompatibleModel(model, definition) {
     selectedVariant: null,
     description: String(model?.description || "").trim() || null,
   };
+}
+
+function toPositiveInt(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : null;
 }
 
 function mergeUsage(current, next) {

@@ -910,7 +910,13 @@ function ensureSelectionDefaults() {
     state.selectedModel = loadedModel?.key || firstChatModel?.modelKey || firstLlm?.key || state.models[0]?.key || "";
   }
 
-  if (!state.selectedContextLength) {
+  // applyChatDefaultsPayload may have run the suggestion with no model yet
+  // resolved (empty defaults modelKey), landing on the fallback; once the
+  // model list and selection exist, a non-manual value is re-derived from
+  // the server-reported context.
+  if (!state.contextLengthManual && findSelectedModel()) {
+    applySuggestedContextLength(findSelectedModel());
+  } else if (!state.selectedContextLength) {
     applySuggestedContextLength(findSelectedModel());
   }
 
@@ -1696,6 +1702,7 @@ function renderModelDetails() {
       model.displayName && model.displayName !== model.key ? model.displayName : model.key,
       model.displayName && model.displayName !== model.key ? `key: ${model.key}` : null,
       `${getActiveProviderLabel()} catalog`,
+      model.maxContextLength ? `${formatInteger(model.maxContextLength)} max ctx` : null,
       capabilityParts.join(" • "),
     ].filter(Boolean);
 

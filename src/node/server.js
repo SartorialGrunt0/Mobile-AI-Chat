@@ -288,9 +288,18 @@ function createApp() {
       return;
     }
 
-    const chatOverrides = normalizeChatOverridePayload(request.body?.chatOverrides ?? request.body);
-    const mcpServerIds = normalizeMcpServerIds(request.body?.mcpServerIds ?? request.body?.selectedMcpServerIds);
-    const validationErrors = validateChatDefaults(chatOverrides);
+    const body = request.body && typeof request.body === "object" ? request.body : {};
+    const hasBodyKey = key => Object.prototype.hasOwnProperty.call(body, key);
+
+    // A body WITHOUT a chatOverrides key means "leave overrides untouched"
+    // (undefined); an explicit chatOverrides:null means "clear them" (null).
+    const chatOverrides = hasBodyKey("chatOverrides")
+      ? normalizeChatOverridePayload(body.chatOverrides)
+      : normalizeChatOverridePayload(body) ?? undefined;
+    const mcpServerIds = hasBodyKey("mcpServerIds") || hasBodyKey("selectedMcpServerIds")
+      ? normalizeMcpServerIds(body.mcpServerIds ?? body.selectedMcpServerIds)
+      : undefined;
+    const validationErrors = chatOverrides ? validateChatDefaults(chatOverrides) : null;
     if (validationErrors) {
       response.status(400).json({
         title: "One or more validation errors occurred.",
@@ -405,6 +414,11 @@ function createApp() {
       return;
     }
 
+    if (request.appState.activeStreamChatIds.has(retryContext.chatId)) {
+      response.status(409).json({ error: "This chat is already generating a response." });
+      return;
+    }
+
     const overrideSource = request.body && typeof request.body === "object" ? request.body : {};
     const overrideRequest = normalizeChatStreamRequest(overrideSource);
     const hasOverride = key => Object.prototype.hasOwnProperty.call(overrideSource, key);
@@ -453,6 +467,10 @@ function createApp() {
         response.sendStatus(404);
         return;
       }
+      if (request.appState.activeStreamChatIds.has(chat.id)) {
+        response.status(409).json({ error: "This chat is already generating a response." });
+        return;
+      }
     }
 
     request.appState.repository.saveUserMessage(chat.id, chatRequest);
@@ -471,6 +489,10 @@ function createApp() {
       response.sendStatus(404);
       return;
     }
+    if (request.appState.activeStreamChatIds.has(chatId)) {
+      response.status(409).json({ error: "This chat is already generating a response." });
+      return;
+    }
 
     const chatRequest = normalizeChatStreamRequest({ ...request.body, chatId });
     if (!chatRequest.model || (!chatRequest.input.trim() && chatRequest.attachments.length === 0)) {
@@ -479,7 +501,9 @@ function createApp() {
     }
 
     const previousResponseId = request.appState.repository.truncateFromMessage(chatId, messageId);
-    if (previousResponseId === null && !request.appState.repository.getChatRecord(chatId)) {
+    if (previousResponseId === undefined) {
+      // The message id does not exist in this chat (stale tab, retried/deleted
+      // turn). Truncating nothing would turn the edit into an appended duplicate.
       response.sendStatus(404);
       return;
     }
@@ -493,6 +517,22 @@ function createApp() {
 
   app.get("*", (_request, response) => {
     response.sendFile(path.join(staticRoot, "index.html"));
+  });
+
+  // Terminal error handler: never let Express render its development error
+  // page (stack traces + absolute paths) to any LAN client.
+  app.use((error, request, response, next) => {
+    const status = Number.isInteger(error?.status) ? error.status : Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    if (request.appState?.logger) {
+      request.appState.logger.error(`Unhandled error for ${request.method} ${request.originalUrl}.`, error);
+    }
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
+    response.status(status).json({
+      detail: status >= 500 ? "Internal server error. Check the service log for details." : (error?.message || "Bad request.")
+    });
   });
 
   scheduleAdaptiveMemoryRefresh(state, providerClient);
@@ -554,22 +594,38 @@ function buildChatDefaultsByProviderResponse(config) {
 }
 
 function normalizeSettingsPayload(payload, currentConfig) {
-  const activeProvider = normalizeProviderId(payload?.activeProvider || getActiveProviderId(currentConfig));
+  const hasOwn = (obj, key) => obj && typeof obj === "object" && Object.prototype.hasOwnProperty.call(obj, key);
+  const activeProvider = hasOwn(payload, "activeProvider")
+    ? normalizeProviderId(payload.activeProvider)
+    : normalizeProviderId(getActiveProviderId(currentConfig));
   const rawProviders = payload?.providers && typeof payload.providers === "object"
     ? payload.providers
     : {};
   const providers = {};
   for (const definition of listProviderDefinitions()) {
     const currentProfile = getProviderProfile(currentConfig, definition.id);
+    const flatActiveProfile = definition.id === activeProvider && !hasOwn(rawProviders, definition.id) ? payload : null;
     const rawProvider = rawProviders[definition.id] && typeof rawProviders[definition.id] === "object"
       ? rawProviders[definition.id]
-      : definition.id === activeProvider
-        ? payload
-        : {};
+      : flatActiveProfile || {};
+
+    // Absent keys mean "keep the current value" (matching the mcpServers
+    // pass-through semantics); only keys actually present in the body overwrite.
+    const baseUrlSource = hasOwn(rawProvider, "baseUrl") ? rawProvider : flatActiveProfile && hasOwn(flatActiveProfile, "baseUrl") ? flatActiveProfile : null;
+    const tokenSource = hasOwn(rawProvider, "apiToken") || hasOwn(rawProvider, "keepApiToken")
+      ? rawProvider
+      : flatActiveProfile && (hasOwn(flatActiveProfile, "apiToken") || hasOwn(flatActiveProfile, "keepApiToken"))
+        ? flatActiveProfile
+        : null;
+    const apiTokenPresent = tokenSource !== null && hasOwn(tokenSource, "apiToken");
+    const keepApiToken = tokenSource !== null && hasOwn(tokenSource, "keepApiToken")
+      ? Boolean(tokenSource.keepApiToken)
+      : !apiTokenPresent;
+
     providers[definition.id] = {
-      baseUrl: String(rawProvider.baseUrl ?? (definition.id === activeProvider ? payload?.baseUrl : currentProfile.BaseUrl) ?? "").trim(),
-      apiToken: String(rawProvider.apiToken ?? (definition.id === activeProvider ? payload?.apiToken : "") ?? "").trim(),
-      keepApiToken: Boolean(rawProvider.keepApiToken ?? (definition.id === activeProvider ? payload?.keepApiToken : Boolean(currentProfile.ApiToken))),
+      baseUrl: baseUrlSource !== null ? String(baseUrlSource.baseUrl ?? "").trim() : String(currentProfile.BaseUrl || "").trim(),
+      apiToken: apiTokenPresent && !keepApiToken ? String(tokenSource.apiToken ?? "").trim() : String(currentProfile.ApiToken || ""),
+      keepApiToken,
     };
   }
 
@@ -577,10 +633,14 @@ function normalizeSettingsPayload(payload, currentConfig) {
     activeProvider,
     providers,
     mcpServers: normalizeMcpServersPayload(payload?.mcpServers),
-    chatFontScale: toOptionalFloat(payload?.chatFontScale) || 1,
-    requireLogin: Boolean(payload?.requireLogin),
-    pin: String(payload?.pin || "").trim(),
-    adaptiveMemory: normalizeAdaptiveMemoryPayload(payload?.adaptiveMemory)
+    chatFontScale: hasOwn(payload, "chatFontScale")
+      ? (toOptionalFloat(payload.chatFontScale) || 1)
+      : (currentConfig.Ui?.ChatFontScale || 1),
+    requireLogin: hasOwn(payload, "requireLogin") ? Boolean(payload.requireLogin) : hasPin(currentConfig.Security),
+    pin: hasOwn(payload, "pin") ? String(payload.pin || "").trim() : "",
+    adaptiveMemory: hasOwn(payload, "adaptiveMemory")
+      ? normalizeAdaptiveMemoryPayload(payload.adaptiveMemory)
+      : buildAdaptiveMemoryResponse(currentConfig)
   };
 }
 
@@ -705,6 +765,10 @@ function validateSettings(settings) {
 }
 
 function validateChatDefaults(chatDefaults) {
+  if (!chatDefaults) {
+    return null;
+  }
+
   if (chatDefaults.temperature !== null && (chatDefaults.temperature < 0 || chatDefaults.temperature > 1)) {
     return { temperature: ["Temperature must be between 0 and 1."] };
   }
@@ -809,6 +873,8 @@ function normalizeMcpServerIds(value) {
   return Array.isArray(value) ? value.map(entry => String(entry || "").trim()).filter(Boolean) : [];
 }
 
+const STREAM_WRITE_TIMEOUT_MS = 15000;
+
 async function streamChat(request, response, providerClient, chatRequest, options = {}) {
   const activeProviderId = getActiveProviderId(request.appState.config);
   const activeProviderDefinition = getProviderDefinition(activeProviderId);
@@ -835,17 +901,47 @@ async function streamChat(request, response, providerClient, chatRequest, option
 
   const canWriteToClient = () => clientConnectionOpen && !response.writableEnded && !response.destroyed;
 
+  // A stalled client (phone asleep, receive window shut) can leave the
+  // response.write callback pending forever. Bound each write: on stall, treat
+  // the client as gone and destroy the response — but never abort the provider
+  // stream itself, so the answer still completes and persists (the
+  // tab-switch-keeps-streaming design).
   const writeStreamEvent = async (eventType, payload) => {
     if (!canWriteToClient()) {
       return false;
     }
 
+    let timer = null;
     try {
-      await writeSse(response, eventType, payload);
-      return true;
+      const wrote = await Promise.race([
+        writeSse(response, eventType, payload).then(() => true, () => false),
+        new Promise(resolve => {
+          timer = setTimeout(() => resolve(false), STREAM_WRITE_TIMEOUT_MS);
+          if (typeof timer.unref === "function") {
+            timer.unref();
+          }
+        })
+      ]);
+
+      if (wrote) {
+        return true;
+      }
+
+      markClientDisconnected();
+      if (!response.destroyed) {
+        try {
+          response.destroy();
+        } catch {
+        }
+      }
+      return false;
     } catch {
       markClientDisconnected();
       return false;
+    } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
     }
   };
 
@@ -919,7 +1015,10 @@ async function streamChat(request, response, providerClient, chatRequest, option
       response.end();
     }
   } finally {
-    if (options.persistChatId) {
+    if (options.persistChatId && request.appState.activeStreamAbortControllers.get(options.persistChatId) === streamAbortController) {
+      // Only tear down the registry entries if they still belong to this
+      // stream — a concurrent stream for the same chat must not be orphaned
+      // by whichever stream finishes first.
       request.appState.activeStreamChatIds.delete(options.persistChatId);
       request.appState.activeStreamAbortControllers.delete(options.persistChatId);
     }
@@ -1109,14 +1208,18 @@ async function refreshAdaptiveMemoryIfDue(appState, lmStudioClient, options = {}
       maxWords: adaptiveMemory.maxWords
     });
     const latestMessage = messages[messages.length - 1];
+    // Re-read the block AFTER the await: settings changed while the model call
+    // was in flight (enable/disable, word limit, edited summary) must not be
+    // reverted by the pre-await snapshot.
+    const currentAdaptiveMemory = buildAdaptiveMemoryResponse(appState.config);
     const payload = {
       ...buildRuntimeSettingsPayload(appState.config),
       adaptiveMemory: {
-        ...adaptiveMemory,
-        summary: summary || adaptiveMemory.summary,
-        lastUpdatedUtc: summary ? new Date().toISOString() : adaptiveMemory.lastUpdatedUtc,
+        ...currentAdaptiveMemory,
+        summary: summary || currentAdaptiveMemory.summary,
+        lastUpdatedUtc: summary ? new Date().toISOString() : currentAdaptiveMemory.lastUpdatedUtc,
         lastReviewedUtc: new Date().toISOString(),
-        sourceCursorUtc: latestMessage?.createdAt || adaptiveMemory.sourceCursorUtc
+        sourceCursorUtc: latestMessage?.createdAt || currentAdaptiveMemory.sourceCursorUtc
       }
     };
     persistRuntimeSettings(appState, payload);

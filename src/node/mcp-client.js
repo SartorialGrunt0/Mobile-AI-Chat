@@ -88,11 +88,6 @@ async function callTool(server, toolName, args, signal = null) {
 
   return text;
 }
-async function probeServer(server, signal = null) {
-  const tools = await listTools(server, signal);
-  return { ok: true, toolCount: tools.length };
-}
-
 async function openSession(server, signal) {
   const session = { sessionId: "" };
 
@@ -330,5 +325,4 @@ module.exports = {
   McpClientError,
   callTool,
   listTools,
-  probeServer,
 };

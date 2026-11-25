@@ -75,4 +75,4 @@ async function readWithIdleTimeout(reader, timeoutMs = STREAM_IDLE_TIMEOUT_MS) {
   }
 }
 
-module.exports = { fetchWithHeadersTimeout, readWithIdleTimeout, HEADERS_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS };
+module.exports = { fetchWithHeadersTimeout, readWithIdleTimeout };

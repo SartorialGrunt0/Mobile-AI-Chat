@@ -862,15 +862,31 @@ function buildStreamStats(usage, timings) {
   const timeToFirstTokenSeconds = timings && typeof timings.firstDeltaAtMs === "number" && typeof timings.streamStartedAtMs === "number"
     ? Math.max((timings.firstDeltaAtMs - timings.streamStartedAtMs) / 1000, 0)
     : null;
+  const promptPerSecond = derivePromptPerSecond(inputTokens, timeToFirstTokenSeconds);
 
   const stats = {
     input_tokens: inputTokens,
     total_output_tokens: outputTokens,
     tokens_per_second: tokensPerSecond,
     time_to_first_token_seconds: timeToFirstTokenSeconds,
+    prompt_per_second: promptPerSecond,
   };
 
   return Object.values(stats).some(value => value !== null) ? stats : null;
+}
+
+// Prefill rate is not reported natively by any provider; it is estimated as
+// prompt tokens over time-to-first-token. That window includes queueing and, on a
+// cold lazy-load slot, model load time, so the estimate reads low in those cases.
+function derivePromptPerSecond(inputTokens, timeToFirstTokenSeconds) {
+  if (typeof inputTokens !== "number" || inputTokens <= 0) {
+    return null;
+  }
+  if (typeof timeToFirstTokenSeconds !== "number" || timeToFirstTokenSeconds <= MIN_DECODE_WINDOW_MS / 1000) {
+    return null;
+  }
+
+  return inputTokens / timeToFirstTokenSeconds;
 }
 
 function firstFiniteNumber(...values) {

@@ -2535,6 +2535,9 @@ function renderMessageStats(stats) {
   if (typeof stats.tokensPerSecond === "number") {
     parts.push(`${formatNumber(stats.tokensPerSecond)} tok/s`);
   }
+  if (typeof stats.promptPerSecond === "number") {
+    parts.push(`~${formatNumber(stats.promptPerSecond)} tok/s prefill`);
+  }
   if (typeof stats.totalTimeSeconds === "number") {
     parts.push(`${formatDuration(stats.totalTimeSeconds)} total`);
   }
@@ -4263,27 +4266,35 @@ function resolveResponseContextLimit(result, modelKey) {
 }
 
 function normalizeStreamStats(result, modelKey) {
-  const stats = result?.stats;
-  if (!stats) {
+  const source = result?.stats;
+  if (!source) {
     return null;
   }
 
-  const totalOutputTokens = firstFiniteNumber(stats.totalOutputTokens, stats.total_output_tokens);
-  const reasoningOutputTokens = firstFiniteNumber(stats.reasoningOutputTokens, stats.reasoning_output_tokens);
+  const totalOutputTokens = firstFiniteNumber(source.totalOutputTokens, source.total_output_tokens);
+  const reasoningOutputTokens = firstFiniteNumber(source.reasoningOutputTokens, source.reasoning_output_tokens);
 
-  return {
-    inputTokens: firstFiniteNumber(stats.inputTokens, stats.input_tokens),
+  const stats = {
+    inputTokens: firstFiniteNumber(source.inputTokens, source.input_tokens),
     totalOutputTokens,
     answerOutputTokens: typeof totalOutputTokens === "number"
       ? Math.max(totalOutputTokens - (typeof reasoningOutputTokens === "number" ? reasoningOutputTokens : 0), 0)
       : null,
     reasoningOutputTokens,
-    tokensPerSecond: firstFiniteNumber(stats.tokensPerSecond, stats.tokens_per_second),
-    timeToFirstTokenSeconds: firstFiniteNumber(stats.timeToFirstTokenSeconds, stats.time_to_first_token_seconds),
-    modelLoadTimeSeconds: firstFiniteNumber(stats.modelLoadTimeSeconds, stats.model_load_time_seconds),
-    totalTimeSeconds: firstFiniteNumber(stats.totalTimeSeconds, stats.total_time_seconds),
+    tokensPerSecond: firstFiniteNumber(source.tokensPerSecond, source.tokens_per_second),
+    timeToFirstTokenSeconds: firstFiniteNumber(source.timeToFirstTokenSeconds, source.time_to_first_token_seconds),
+    promptPerSecond: firstFiniteNumber(source.promptPerSecond, source.prompt_per_second),
+    modelLoadTimeSeconds: firstFiniteNumber(source.modelLoadTimeSeconds, source.model_load_time_seconds),
+    totalTimeSeconds: firstFiniteNumber(source.totalTimeSeconds, source.total_time_seconds),
     contextLimit: resolveResponseContextLimit(result, modelKey),
   };
+
+  // Prefill rate is not reported natively by providers; estimate prompt tokens over TTFT.
+  if (stats.promptPerSecond === null && typeof stats.inputTokens === "number" && stats.inputTokens > 0 && typeof stats.timeToFirstTokenSeconds === "number" && stats.timeToFirstTokenSeconds > 0) {
+    stats.promptPerSecond = stats.inputTokens / stats.timeToFirstTokenSeconds;
+  }
+
+  return stats;
 }
 
 function parseMarkdownTableRow(line) {

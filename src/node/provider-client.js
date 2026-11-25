@@ -3,8 +3,11 @@ const { TextDecoder } = require("node:util");
 // Delta windows shorter than this are frame-coalescing noise, not a measurable
 // decode rate; tokens_per_second is left null for them instead of reporting noise.
 const MIN_DECODE_WINDOW_MS = 10;
+const MAX_TOOL_ROUNDS = 8;
+const OPENAI_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
 const { LmStudioClient } = require("./lm-studio-client");
+const { listTools: listMcpTools, callTool: runMcpTool } = require("./mcp-client");
 const { relayLmStudioStream } = require("./lm-studio-stream");
 const { getActiveProviderId, getProviderConnectionSettings, getProviderDefinition } = require("./provider-config");
 
@@ -158,77 +161,86 @@ class ProviderClient {
   }
 
   async streamOpenAiCompatibleChat(connection, request, signal, onEvent) {
+    const mcpServers = Array.isArray(request.mcpServers) ? request.mcpServers : [];
+    const toolRegistry = mcpServers.length > 0 ? await buildToolRegistry(mcpServers, signal) : null;
+
     const streamStartedAtMs = Date.now();
     let firstDeltaAtMs = null;
     let lastDeltaAtMs = null;
 
-    const response = await this.sendJson(connection, "POST", "chat/completions", {
-      model: request.model,
-      messages: buildOpenAiMessages(request.messages, request.systemPrompt),
-      stream: true,
-      stream_options: { include_usage: true },
-      temperature: request.temperature ?? undefined,
-      top_p: request.topP ?? undefined,
-    }, {
-      acceptEventStream: true,
-      signal,
-      allowFailure: true,
-    });
+    const markDeltaTiming = () => {
+      const deltaAtMs = Date.now();
+      firstDeltaAtMs = firstDeltaAtMs ?? deltaAtMs;
+      lastDeltaAtMs = deltaAtMs;
+    };
 
-    if (!response.ok) {
-      throw new Error(await this.readError(response, connection.definition.displayName));
-    }
-
-    await onEvent("chat.start", JSON.stringify({ model: request.model, provider: connection.providerId }));
-
+    const messages = buildOpenAiMessages(request.messages, request.systemPrompt);
+    const usageTotals = { input_tokens: null, output_tokens: null };
+    const reasoningParts = [];
+    const contentParts = [];
+    const toolCallRecords = [];
     let responseId = null;
-    let usage = null;
-    const reasoning = [];
-    const message = [];
 
-    await consumeSseStream(response.body, async frame => {
-      const payload = String(frame.payload || "").trim();
-      if (!payload || payload === "[DONE]") {
-        return;
+    for (let round = 0; ; round += 1) {
+      if (signal?.aborted) {
+        throw createAbortError();
       }
 
-      const parsed = safeParseJson(payload);
-      if (!parsed) {
-        return;
+      const roundResult = await streamSingleRound(this, connection, request, messages, toolRegistry, round === 0, signal, onEvent, markDeltaTiming);
+      responseId = roundResult.responseId || responseId;
+      accumulateUsage(usageTotals, roundResult.usage);
+      reasoningParts.push(roundResult.reasoning);
+      contentParts.push(roundResult.content);
+
+      if (roundResult.toolCalls.length === 0) {
+        break;
       }
 
-      responseId = parsed.id || responseId;
-      usage = parsed.usage || usage;
-
-      const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
-      const delta = choice?.delta || {};
-      const reasoningDelta = normalizeOpenAiDelta(delta.reasoning_content ?? delta.reasoning ?? delta.reasoningContent ?? null);
-      const contentDelta = normalizeOpenAiDelta(delta.content);
-
-      if (reasoningDelta || contentDelta) {
-        const deltaAtMs = Date.now();
-        firstDeltaAtMs = firstDeltaAtMs ?? deltaAtMs;
-        lastDeltaAtMs = deltaAtMs;
+      if (round >= MAX_TOOL_ROUNDS) {
+        throw new Error(`Tool calling stopped after ${MAX_TOOL_ROUNDS} rounds without a final answer.`);
       }
 
-      if (reasoningDelta) {
-        reasoning.push(reasoningDelta);
-        await onEvent("reasoning.delta", JSON.stringify({ content: reasoningDelta }));
-      }
+      messages.push({
+        role: "assistant",
+        content: roundResult.content || null,
+        tool_calls: roundResult.toolCalls.map(entry => ({
+          id: entry.id,
+          type: "function",
+          function: { name: entry.name, arguments: entry.arguments || "{}" },
+        })),
+      });
 
-      if (contentDelta) {
-        message.push(contentDelta);
-        await onEvent("message.delta", JSON.stringify({ content: contentDelta }));
+      for (const entry of roundResult.toolCalls) {
+        const resolved = toolRegistry.resolve(entry.name);
+        await onEvent("tool_call.start", JSON.stringify({ tool: resolved.displayName }));
+
+        const parsedArguments = safeParseJson(entry.arguments || "{}") || {};
+        await onEvent("tool_call.arguments", JSON.stringify({ arguments: parsedArguments }));
+
+        let toolOutput;
+        try {
+          toolOutput = resolved
+            ? await callMcpTool(resolved.server, resolved.toolName, parsedArguments, signal)
+            : `Unknown tool ${entry.name}.`;
+          await onEvent("tool_call.success", JSON.stringify({ output: toolOutput }));
+        } catch (error) {
+          toolOutput = `Tool call failed: ${error.message}`;
+          await onEvent("tool_call.failure", JSON.stringify({ output: toolOutput }));
+        }
+
+        toolCallRecords.push({ tool: resolved?.displayName || entry.name, arguments: parsedArguments, output: toolOutput });
+        messages.push({ role: "tool", tool_call_id: entry.id, content: String(toolOutput ?? "") });
       }
-    });
+    }
 
     return buildFinalResponse({
       model: request.model,
       contextLength: request.contextLength,
       responseId,
-      reasoning: reasoning.join(""),
-      content: message.join(""),
-      usage,
+      reasoning: reasoningParts.filter(Boolean).join("\n"),
+      content: contentParts.filter(Boolean).join("\n"),
+      usage: usageTotals,
+      toolCalls: toolCallRecords,
       timings: { streamStartedAtMs, firstDeltaAtMs, lastDeltaAtMs },
     });
   }
@@ -823,10 +835,183 @@ function mergeUsage(current, next) {
   };
 }
 
+// One streamed round-trip of the OpenAI-compatible tool loop. Deltas for text and
+// reasoning are relayed live; tool_calls deltas are fragments that must be
+// accumulated by index (the spec streams name and argument pieces separately).
+async function streamSingleRound(providerClient, connection, request, messages, toolRegistry, isFirstRound, signal, onEvent, markDeltaTiming) {
+  const response = await providerClient.sendJson(connection, "POST", "chat/completions", {
+    model: request.model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+    temperature: request.temperature ?? undefined,
+    top_p: request.topP ?? undefined,
+    ...(toolRegistry && toolRegistry.tools.length > 0 ? { tools: toolRegistry.tools } : {}),
+  }, {
+    acceptEventStream: true,
+    signal,
+    allowFailure: true,
+  });
+
+  if (!response.ok) {
+    throw new Error(await providerClient.readError(response, connection.definition.displayName));
+  }
+
+  if (isFirstRound) {
+    await onEvent("chat.start", JSON.stringify({ model: request.model, provider: connection.providerId }));
+  }
+
+  let responseId = null;
+  let usage = null;
+  const reasoning = [];
+  const content = [];
+  const toolCallsByIndex = new Map();
+
+  await consumeSseStream(response.body, async frame => {
+    const payload = String(frame.payload || "").trim();
+    if (!payload || payload === "[DONE]") {
+      return;
+    }
+
+    const parsed = safeParseJson(payload);
+    if (!parsed) {
+      return;
+    }
+
+    responseId = parsed.id || responseId;
+    usage = parsed.usage || usage;
+
+    const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+    const delta = choice?.delta || {};
+    const reasoningDelta = normalizeOpenAiDelta(delta.reasoning_content ?? delta.reasoning ?? delta.reasoningContent ?? null);
+    const contentDelta = normalizeOpenAiDelta(delta.content);
+
+    if (reasoningDelta || contentDelta) {
+      markDeltaTiming();
+    }
+
+    if (reasoningDelta) {
+      reasoning.push(reasoningDelta);
+      await onEvent("reasoning.delta", JSON.stringify({ content: reasoningDelta }));
+    }
+
+    if (contentDelta) {
+      content.push(contentDelta);
+      await onEvent("message.delta", JSON.stringify({ content: contentDelta }));
+    }
+
+    for (const fragment of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const index = Number.isInteger(fragment?.index) ? fragment.index : toolCallsByIndex.size;
+      const entry = toolCallsByIndex.get(index) || { id: "", name: "", arguments: "" };
+      entry.id = fragment?.id || entry.id;
+      entry.name = fragment?.function?.name || entry.name;
+      entry.arguments += typeof fragment?.function?.arguments === "string" ? fragment.function.arguments : "";
+      toolCallsByIndex.set(index, entry);
+    }
+  });
+
+  const toolCalls = [...toolCallsByIndex.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([index, entry], position) => ({
+      id: entry.id || `call_${position + 1}`,
+      name: entry.name,
+      arguments: entry.arguments,
+    }))
+    .filter(entry => entry.name);
+
+  return { responseId, usage, reasoning: reasoning.join(""), content: content.join(""), toolCalls };
+}
+
+function accumulateUsage(totals, usage) {
+  const inputTokens = firstFiniteNumber(usage?.input_tokens ?? usage?.prompt_tokens);
+  const outputTokens = firstFiniteNumber(usage?.output_tokens ?? usage?.completion_tokens);
+
+  if (typeof inputTokens === "number") {
+    totals.input_tokens = (totals.input_tokens ?? 0) + inputTokens;
+  }
+
+  if (typeof outputTokens === "number") {
+    totals.output_tokens = (totals.output_tokens ?? 0) + outputTokens;
+  }
+}
+
+// Builds the flattened tools payload from every selected MCP server. OpenAI-style
+// endpoints require ^[a-zA-Z0-9_-]{1,64}$ function names, so server tools are
+// namespaced as `<serverId>__<tool>` and resolved back on call. An unreachable
+// selected server fails the request rather than silently dropping its tools.
+async function buildToolRegistry(servers, signal) {
+  const tools = [];
+  const byExposedName = new Map();
+
+  for (const server of servers) {
+    const serverPrefix = sanitizeToolName(server.Label || server.Id);
+    const serverTools = await listMcpTools(server, signal);
+
+    for (const tool of serverTools) {
+      let exposedName = `${serverPrefix}__${sanitizeToolName(tool.name)}`;
+      if (exposedName.length > 64) {
+        exposedName = exposedName.slice(0, 64);
+      }
+
+      while (byExposedName.has(exposedName)) {
+        exposedName = `${exposedName.slice(0, 61)}_x`;
+      }
+
+      tools.push({
+        type: "function",
+        function: {
+          name: exposedName,
+          description: `${tool.description || tool.name} (from MCP server "${server.Label}")`.slice(0, 1024),
+          parameters: tool.inputSchema,
+        },
+      });
+
+      byExposedName.set(exposedName, {
+        server,
+        toolName: tool.name,
+        displayName: `${server.Label}/${tool.name}`,
+      });
+    }
+  }
+
+  return {
+    tools,
+    resolve(exposedName) {
+      return byExposedName.get(exposedName) || null;
+    },
+  };
+}
+
+async function callMcpTool(server, toolName, args, signal) {
+  return await runMcpTool(server, toolName, args, signal);
+}
+
+function sanitizeToolName(value) {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "") || "mcp";
+}
+
+function createAbortError() {
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
 function buildFinalResponse(options) {
   const output = [];
   if (options.reasoning) {
     output.push({ type: "reasoning", content: options.reasoning });
+  }
+  for (const entry of options.toolCalls || []) {
+    output.push({
+      type: "tool_call",
+      tool: entry.tool,
+      arguments: entry.arguments,
+      output: entry.output,
+      provider_info: { type: "plugin", id: `mcp/${entry.tool}` },
+    });
   }
   if (options.content) {
     output.push({ type: "message", content: options.content });

@@ -17,7 +17,7 @@ const PROVIDER_DEFINITIONS = [
     baseUrlPlaceholder: "https://api.openai.com/v1/",
     modelPlaceholder: "gpt-4.1-mini",
     supportsModelLoad: false,
-    supportsMcp: false,
+    supportsMcp: true,
   },
   {
     id: "hermes-agent",
@@ -27,7 +27,7 @@ const PROVIDER_DEFINITIONS = [
     baseUrlPlaceholder: "https://your-hermes-endpoint.example/v1/",
     modelPlaceholder: "hermes-3-llama-3.1-70b",
     supportsModelLoad: false,
-    supportsMcp: false,
+    supportsMcp: true,
   },
 ];
 
@@ -53,7 +53,6 @@ function getDefaultProviderProfiles() {
     profiles[definition.id] = {
       BaseUrl: definition.defaultBaseUrl,
       ApiToken: "",
-      McpConfigPath: definition.supportsMcp ? "" : "",
     };
   }
 
@@ -92,9 +91,6 @@ function normalizeProviderProfile(definition, profile, legacyLmStudio) {
   return {
     BaseUrl: String(currentProfile.BaseUrl ?? currentProfile.baseUrl ?? legacyProfile.BaseUrl ?? legacyProfile.baseUrl ?? definition.defaultBaseUrl ?? "").trim(),
     ApiToken: String(currentProfile.ApiToken ?? currentProfile.apiToken ?? legacyProfile.ApiToken ?? legacyProfile.apiToken ?? "").trim(),
-    McpConfigPath: definition.supportsMcp
-      ? String(currentProfile.McpConfigPath ?? currentProfile.mcpConfigPath ?? legacyProfile.McpConfigPath ?? legacyProfile.mcpConfigPath ?? "").trim()
-      : "",
   };
 }
 
@@ -203,7 +199,6 @@ function getProviderConnectionSettings(config, providerId = null) {
     definition,
     baseUrl: profile.BaseUrl,
     apiToken: profile.ApiToken,
-    mcpConfigPath: profile.McpConfigPath,
   };
 }
 

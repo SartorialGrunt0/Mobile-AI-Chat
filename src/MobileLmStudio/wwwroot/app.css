@@ -406,6 +406,42 @@ body.drawer-open .drawer-backdrop {
   font-size: 0.8rem;
 }
 
+.mcp-server-list {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0.4rem 0;
+}
+
+.mcp-server-row {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  border-radius: 10px;
+}
+
+.mcp-server-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.mcp-server-row .checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text, inherit);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.mcp-server-row input[type="text"],
+.mcp-server-row input[type="password"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
 .toggle-field {
   display: grid;
   grid-template-columns: auto 1fr;

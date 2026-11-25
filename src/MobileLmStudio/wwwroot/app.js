@@ -4,6 +4,7 @@ const state = {
   models: [],
   chats: [],
   mcpServers: [],
+  settingsMcpDraft: [],
   settingsProviders: [],
   settingsProviderDrafts: {},
   settingsActiveProvider: "lmstudio",
@@ -137,11 +138,8 @@ const elements = {
   settingsProvider: document.getElementById("settings-provider"),
   settingsBaseUrl: document.getElementById("settings-base-url"),
   settingsApiToken: document.getElementById("settings-api-token"),
-  settingsMcpField: document.getElementById("settings-mcp-field"),
-  settingsMcpPath: document.getElementById("settings-mcp-path"),
-  settingsMcpUpload: document.getElementById("settings-mcp-upload"),
-  settingsMcpUploadButton: document.getElementById("settings-mcp-upload-button"),
-  settingsMcpUploadName: document.getElementById("settings-mcp-upload-name"),
+  settingsMcpList: document.getElementById("settings-mcp-list"),
+  settingsMcpAddButton: document.getElementById("settings-mcp-add-button"),
   settingsChatFontScale: document.getElementById("settings-chat-font-scale"),
   settingsThemeButton: document.getElementById("settings-theme-button"),
   settingsAutoScrollButton: document.getElementById("settings-auto-scroll-button"),
@@ -573,8 +571,43 @@ function bindEvents() {
     void addComposerAttachments(event.target.files, "file");
     event.target.value = "";
   });
-  elements.settingsMcpUploadButton?.addEventListener("click", () => elements.settingsMcpUpload?.click());
-  elements.settingsMcpUpload?.addEventListener("change", () => renderSelectedMcpConfigLabel());
+  elements.settingsMcpAddButton?.addEventListener("click", () => {
+    state.settingsMcpDraft.push({ id: "", label: "", url: "", token: "", hasToken: false, tokenModified: false, enabled: true });
+    renderSettingsMcpServers();
+  });
+
+  elements.settingsMcpList?.addEventListener("input", event => {
+    const row = event.target.closest("[data-mcp-row]");
+    const server = row && state.settingsMcpDraft[Number(row.dataset.mcpRow)];
+    const field = event.target.dataset.mcpField;
+    if (!server || !field) {
+      return;
+    }
+
+    if (field === "enabled") {
+      server.enabled = event.target.checked === true;
+      return;
+    }
+
+    if (field === "token") {
+      server.token = event.target.value;
+      server.tokenModified = true;
+      event.target.type = "text";
+      return;
+    }
+
+    server[field] = event.target.value;
+  });
+
+  elements.settingsMcpList?.addEventListener("click", event => {
+    const button = event.target.closest("button[data-mcp-remove]");
+    if (!button) {
+      return;
+    }
+
+    state.settingsMcpDraft.splice(Number(button.dataset.mcpRow), 1);
+    renderSettingsMcpServers();
+  });
 
   elements.messageInput.addEventListener("input", autoResizeComposer);
   elements.messageInput.addEventListener("keydown", event => {
@@ -1388,7 +1421,7 @@ function renderBanner() {
     warnings.push(`Set the ${getActiveProviderLabel()} base URL before using the chat or model controls.`);
   }
   if (activeProviderSupportsMcp() && !state.bootstrap.mcpConfigured) {
-    warnings.push("Set or upload an MCP config to list MCP servers inside the client.");
+    warnings.push("Add an MCP server in Settings to make its tools available in chats.");
   }
   if (state.bootstrap.providerConfigured && !state.bootstrap.hasApiToken && activeProviderLikelyNeedsApiKey()) {
     warnings.push(`Add an API key if ${getActiveProviderLabel()} requires authentication.`);
@@ -1596,18 +1629,19 @@ function renderMcpServers() {
     return;
   }
 
-  if (state.mcpServers.length === 0) {
-    elements.mcpList.innerHTML = '<p class="chat-preview">No MCP servers were found in the configured or uploaded mcp.json file.</p>';
+  const enabledServers = state.mcpServers.filter(server => server.enabled !== false);
+  if (enabledServers.length === 0) {
+    elements.mcpList.innerHTML = '<p class="chat-preview">No MCP servers are enabled. Add them in Settings.</p>';
     return;
   }
 
-  elements.mcpList.innerHTML = state.mcpServers
+  elements.mcpList.innerHTML = enabledServers
     .map(server => {
       const active = state.defaultMcpServerIds.has(server.id);
       return `
         <button type="button" class="chip${active ? " active" : ""}" data-mcp-id="${escapeAttribute(server.id)}">
           ${escapeHtml(server.label)}
-          <small>${escapeHtml(server.transport || server.description || "configured server")}</small>
+          <small>${escapeHtml(server.url || "configured server")}</small>
         </button>`;
     })
     .join("");
@@ -1619,22 +1653,23 @@ function renderDefaultToolsMenu() {
   }
 
   if (!state.bootstrap?.mcpConfigured) {
-    elements.defaultToolsMcpList.innerHTML = '<p class="chat-preview">Set or upload an MCP config to choose default tools.</p>';
+    elements.defaultToolsMcpList.innerHTML = '<p class="chat-preview">Add MCP servers in Settings to choose default tools.</p>';
     return;
   }
 
-  if (state.mcpServers.length === 0) {
-    elements.defaultToolsMcpList.innerHTML = '<p class="chat-preview">No MCP servers were found in the configured or uploaded mcp.json file.</p>';
+  const enabledServers = state.mcpServers.filter(server => server.enabled !== false);
+  if (enabledServers.length === 0) {
+    elements.defaultToolsMcpList.innerHTML = '<p class="chat-preview">No MCP servers are enabled. Add them in Settings.</p>';
     return;
   }
 
-  elements.defaultToolsMcpList.innerHTML = state.mcpServers
+  elements.defaultToolsMcpList.innerHTML = enabledServers
     .map(server => {
       const active = state.defaultMcpServerIds.has(server.id);
       return `
         <button type="button" class="chip${active ? " active" : ""}" data-mcp-id="${escapeAttribute(server.id)}">
           ${escapeHtml(server.label)}
-          <small>${escapeHtml(server.transport || server.description || "configured server")}</small>
+          <small>${escapeHtml(server.url || "configured server")}</small>
         </button>`;
     })
     .join("");
@@ -1881,8 +1916,9 @@ function normalizeSelectedMcpServerIds(serverIds) {
       continue;
     }
 
-    const matchingServer = state.mcpServers.find(server => server.id === serverId || server.label === serverId);
-    normalizedIds.add(matchingServer?.id || serverId);
+    const bareId = String(serverId).replace(/^mcp\//, "");
+    const matchingServer = state.mcpServers.find(server => server.id === bareId || server.label === bareId);
+    normalizedIds.add(matchingServer?.id || bareId);
   }
 
   return normalizedIds;
@@ -3136,18 +3172,19 @@ function renderChatToolsPopup() {
     return;
   }
 
-  if (state.mcpServers.length === 0) {
+  const enabledServers = state.mcpServers.filter(server => server.enabled !== false);
+  if (enabledServers.length === 0) {
     elements.chatToolsMcpList.innerHTML = '<p class="chat-preview">No MCP servers configured.</p>';
     return;
   }
 
-  elements.chatToolsMcpList.innerHTML = state.mcpServers
+  elements.chatToolsMcpList.innerHTML = enabledServers
     .map(server => {
       const active = state.selectedMcpServerIds.has(server.id);
       return `
         <button type="button" class="chip${active ? " active" : ""}" data-mcp-id="${escapeAttribute(server.id)}">
           ${escapeHtml(server.label)}
-          <small>${escapeHtml(server.transport || server.description || "configured server")}</small>
+          <small>${escapeHtml(server.url || "configured server")}</small>
         </button>`;
     })
     .join("");
@@ -3302,18 +3339,19 @@ function renderChatOverrideMenu() {
     return;
   }
 
-  if (state.mcpServers.length === 0) {
+  const enabledServers = state.mcpServers.filter(server => server.enabled !== false);
+  if (enabledServers.length === 0) {
     elements.chatOverrideMcpList.innerHTML = '<p class="chat-preview">No MCP servers configured.</p>';
     return;
   }
 
-  elements.chatOverrideMcpList.innerHTML = state.mcpServers
+  elements.chatOverrideMcpList.innerHTML = enabledServers
     .map(server => {
       const active = state.selectedMcpServerIds.has(server.id);
       return `
         <button type="button" class="chip${active ? " active" : ""}" data-mcp-id="${escapeAttribute(server.id)}">
           ${escapeHtml(server.label)}
-          <small>${escapeHtml(server.transport || server.description || "configured server")}</small>
+          <small>${escapeHtml(server.url || "configured server")}</small>
         </button>`;
     })
     .join("");
@@ -4384,7 +4422,6 @@ function createSettingsProviderDrafts(providers) {
       hasApiToken: provider.hasApiToken === true,
       apiToken: "",
       tokenModified: false,
-      mcpConfigPath: String(provider.mcpConfigPath || ""),
       supportsModelLoad: provider.supportsModelLoad === true,
       supportsMcp: provider.supportsMcp === true,
     };
@@ -4425,9 +4462,6 @@ function captureSettingsProviderDraft(providerId = state.settingsActiveProvider)
   draft.apiToken = elements.settingsApiToken?.value || "";
   draft.tokenModified = elements.settingsApiToken?.dataset.modified === "true" || draft.tokenModified;
   draft.hasApiToken = elements.settingsApiToken?.dataset.originallySet === "true";
-  if (draft.supportsMcp) {
-    draft.mcpConfigPath = elements.settingsMcpPath?.value.trim() || "";
-  }
 }
 
 function applySettingsProviderDraft(providerId) {
@@ -4453,19 +4487,6 @@ function applySettingsProviderDraft(providerId) {
       ? "Token saved — paste new value to replace, or clear to remove"
       : "Optional API token";
   }
-  if (elements.settingsMcpField) {
-    elements.settingsMcpField.hidden = !draft.supportsMcp;
-  }
-  if (elements.settingsMcpUploadButton) {
-    elements.settingsMcpUploadButton.hidden = !draft.supportsMcp;
-  }
-  if (elements.settingsMcpPath) {
-    elements.settingsMcpPath.value = draft.supportsMcp ? draft.mcpConfigPath || "" : "";
-  }
-  if (elements.settingsMcpUpload) {
-    elements.settingsMcpUpload.value = "";
-  }
-  renderSelectedMcpConfigLabel(draft.supportsMcp ? draft.mcpConfigPath : "");
 }
 
 function switchSettingsProvider(providerId) {
@@ -4491,9 +4512,16 @@ async function openSettings() {
     if (elements.settingsEnterKeyBehavior) {
       elements.settingsEnterKeyBehavior.value = loadEnterKeyBehavior();
     }
-    if (elements.settingsMcpUpload) {
-      elements.settingsMcpUpload.value = "";
-    }
+    state.settingsMcpDraft = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).map(server => ({
+      id: String(server.id || ""),
+      label: String(server.label || ""),
+      url: String(server.url || ""),
+      token: "",
+      hasToken: server.hasToken === true,
+      tokenModified: false,
+      enabled: server.enabled !== false,
+    }));
+    renderSettingsMcpServers();
     if (elements.settingsRequireLogin) {
       elements.settingsRequireLogin.checked = Boolean(settings.requireLogin);
     }
@@ -4533,15 +4561,6 @@ async function saveSettings() {
 
   const activeDraft = getSettingsProviderDraft();
 
-  let mcpConfigUpload = null;
-  if (activeDraft?.supportsMcp && elements.settingsMcpUpload?.files?.[0]) {
-    const selectedFile = elements.settingsMcpUpload.files[0];
-    mcpConfigUpload = {
-      fileName: selectedFile.name,
-      content: await selectedFile.text(),
-    };
-  }
-
   const providersPayload = {};
   for (const provider of state.settingsProviders) {
     const draft = getSettingsProviderDraft(provider.id);
@@ -4554,8 +4573,6 @@ async function saveSettings() {
       baseUrl: draft.baseUrl.trim(),
       apiToken: keepApiToken ? "" : draft.apiToken.trim(),
       keepApiToken,
-      mcpConfigPath: draft.supportsMcp ? draft.mcpConfigPath.trim() : "",
-      mcpConfigUpload: draft.supportsMcp && provider.id === state.settingsActiveProvider ? mcpConfigUpload : null,
     };
   }
 
@@ -4567,8 +4584,7 @@ async function saveSettings() {
     baseUrl: activeDraft?.baseUrl.trim() || "",
     apiToken: activeKeepApiToken ? "" : activeDraft?.apiToken.trim() || "",
     keepApiToken: activeKeepApiToken,
-    mcpConfigPath: activeDraft?.supportsMcp ? activeDraft.mcpConfigPath.trim() : "",
-    mcpConfigUpload,
+    mcpServers: buildSettingsMcpServersPayload(),
     chatFontScale: normalizeChatFontScale(elements.settingsChatFontScale?.value),
     adaptiveMemory: {
       enabled: elements.settingsAdaptiveMemoryEnabled?.checked === true,
@@ -4595,13 +4611,20 @@ async function saveSettings() {
       elements.settingsPin.value = "";
       elements.settingsPin.dataset.hasExistingPin = payload.requireLogin ? "true" : "false";
     }
-    if (elements.settingsMcpUpload) {
-      elements.settingsMcpUpload.value = "";
-    }
     state.settingsProviders = Array.isArray(settings.providers) ? settings.providers : state.settingsProviders;
     state.settingsProviderDrafts = createSettingsProviderDrafts(state.settingsProviders);
     state.settingsActiveProvider = settings.activeProvider || state.settingsActiveProvider;
     applySettingsProviderDraft(state.settingsActiveProvider);
+    state.settingsMcpDraft = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).map(server => ({
+      id: String(server.id || ""),
+      label: String(server.label || ""),
+      url: String(server.url || ""),
+      token: "",
+      hasToken: server.hasToken === true,
+      tokenModified: false,
+      enabled: server.enabled !== false,
+    }));
+    renderSettingsMcpServers();
     state.chatFontScale = normalizeChatFontScale(settings.chatFontScale);
     applyChatFontScale(state.chatFontScale);
     state.adaptiveMemory = normalizeAdaptiveMemoryState(settings.adaptiveMemory);
@@ -4786,20 +4809,47 @@ function applyChatFontScale(value) {
   document.documentElement.style.setProperty("--chat-font-scale", String(normalizeChatFontScale(value)));
 }
 
-function renderSelectedMcpConfigLabel(currentPath = "") {
-  if (!elements.settingsMcpUploadName) {
+function renderSettingsMcpServers() {
+  if (!elements.settingsMcpList) {
     return;
   }
 
-  const selectedFile = elements.settingsMcpUpload?.files?.[0];
-  if (selectedFile) {
-    elements.settingsMcpUploadName.textContent = `Selected upload: ${selectedFile.name}`;
-    elements.settingsMcpUploadName.hidden = false;
+  if (state.settingsMcpDraft.length === 0) {
+    elements.settingsMcpList.innerHTML = '<p class="chat-preview">No MCP servers configured yet.</p>';
     return;
   }
 
-  elements.settingsMcpUploadName.textContent = "";
-  elements.settingsMcpUploadName.hidden = true;
+  elements.settingsMcpList.innerHTML = state.settingsMcpDraft
+    .map((server, index) => {
+      const tokenPlaceholder = server.hasToken && !server.tokenModified
+        ? "Token saved — paste to replace, or clear to remove"
+        : "Optional bearer token";
+      return `
+        <div class="mcp-server-row" data-mcp-row="${index}">
+          <div class="mcp-server-row-head">
+            <label class="checkbox-label"><input type="checkbox" data-mcp-field="enabled" ${server.enabled ? "checked" : ""} /> Enabled</label>
+            <button type="button" class="ghost-button" data-mcp-remove="true" data-mcp-row="${index}" title="Remove server">Remove</button>
+          </div>
+          <input type="text" data-mcp-field="label" placeholder="Label (e.g. Home NAS)" value="${escapeAttribute(server.label)}" />
+          <input type="text" data-mcp-field="url" placeholder="https://host:4321/mcp" value="${escapeAttribute(server.url)}" />
+          <input type="${server.hasToken && !server.tokenModified ? "password" : "text"}" data-mcp-field="token" placeholder="${escapeAttribute(tokenPlaceholder)}" value="${escapeAttribute(server.tokenModified ? server.token : "")}" autocomplete="off" spellcheck="false" />
+        </div>`;
+    })
+    .join("");
+}
+
+function buildSettingsMcpServersPayload() {
+  return state.settingsMcpDraft.map(server => {
+    const keepToken = !server.tokenModified && server.hasToken;
+    return {
+      id: server.id,
+      label: server.label.trim(),
+      url: server.url.trim(),
+      token: keepToken ? "" : server.token.trim(),
+      keepToken,
+      enabled: server.enabled,
+    };
+  });
 }
 
 function dismissConfigBanner() {
@@ -5009,7 +5059,6 @@ function renderActionIcons() {
   setButtonIcon(elements.chatToolsButton, "tools");
   setButtonIcon(elements.speechInputButton, "mic");
   setButtonIcon(elements.attachButton, "paperclip");
-  setButtonIcon(elements.settingsMcpUploadButton, "upload");
   setButtonIcon(elements.settingsDownloadMemoryButton, "download");
   setButtonIcon(elements.configBannerDismiss, "close");
   setButtonIcon(elements.modelRefreshButton, "refresh");

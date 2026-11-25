@@ -7,7 +7,7 @@ const { ChatRepository } = require("./chat-repository");
 const { buildChatExport, buildDownloadName, buildMessageExport } = require("./chat-export");
 const { readConfig } = require("./config");
 const { createLogger } = require("./logger");
-const { getServers } = require("./mcp-catalog");
+const { buildMcpServersResponse, findEnabledServers, normalizeMcpServersPayload, resolveMcpServerTokens, validateMcpServers } = require("./mcp-config");
 const { buildAssistantPersistence, writeSse } = require("./lm-studio-stream");
 const { ProviderClient } = require("./provider-client");
 const { getActiveProviderId, getChatDefaultsForProvider, getProviderDefinition, getProviderProfile, listProviderDefinitions, normalizeProviderId } = require("./provider-config");
@@ -64,7 +64,7 @@ function createApp() {
     const activeProviderDefinition = getProviderDefinition(activeProviderId);
     const activeProviderProfile = getProviderProfile(currentConfig, activeProviderId);
     const providerConfigured = Boolean(activeProviderProfile.BaseUrl);
-    const mcpConfigured = activeProviderDefinition.supportsMcp && Boolean(activeProviderProfile.McpConfigPath);
+    const mcpConfigured = activeProviderDefinition.supportsMcp && (currentConfig.McpServers || []).some(server => server.Enabled);
     response.json({
       requireLogin,
       authenticated: !requireLogin || isAuthenticated(request, currentConfig.Security),
@@ -170,9 +170,11 @@ function createApp() {
 
     try {
       const resolvedProviders = resolveSettingsProviderTokens(payload, request.appState.config);
+      const resolvedMcpServers = resolveMcpServerTokens(payload.mcpServers, request.appState.config.McpServers || []);
       const resolvedPayload = {
         ...payload,
         providers: resolvedProviders,
+        mcpServers: resolvedMcpServers ?? (request.appState.config.McpServers || []).map(server => ({ ...server })),
         chatDefaults: buildChatDefaultsResponse(request.appState.config, payload.activeProvider),
         chatDefaultsByProvider: buildChatDefaultsByProviderResponse(request.appState.config)
       };
@@ -221,25 +223,8 @@ function createApp() {
     }
   });
 
-  app.get("/api/mcp/servers", async (request, response) => {
-    try {
-      const activeProviderId = getActiveProviderId(request.appState.config);
-      const activeProviderDefinition = getProviderDefinition(activeProviderId);
-      const activeProfile = getProviderProfile(request.appState.config, activeProviderId);
-      if (!activeProviderDefinition.supportsMcp || !activeProfile.McpConfigPath) {
-        response.json([]);
-        return;
-      }
-
-      const servers = await getServers(activeProfile.McpConfigPath);
-      response.json(servers);
-    } catch (error) {
-      const activeProfile = getProviderProfile(request.appState.config, getActiveProviderId(request.appState.config));
-      request.appState.logger.error(`Failed to load MCP servers from ${activeProfile.McpConfigPath || "(empty)"}.`, error);
-      response.status(500).json({
-        detail: error.message
-      });
-    }
+  app.get("/api/mcp/servers", (request, response) => {
+    response.json(buildMcpServersResponse(request.appState.config.McpServers || []));
   });
 
   app.get("/api/models", async (request, response) => {
@@ -532,14 +517,13 @@ function buildSettingsResponse(config) {
         baseUrlPlaceholder: definition.baseUrlPlaceholder,
         modelPlaceholder: definition.modelPlaceholder,
         hasApiToken: Boolean(profile.ApiToken),
-        mcpConfigPath: profile.McpConfigPath || "",
         supportsModelLoad: definition.supportsModelLoad,
         supportsMcp: definition.supportsMcp,
       };
     }),
     baseUrl: activeProfile.BaseUrl || "",
     hasApiToken: Boolean(activeProfile.ApiToken),
-    mcpConfigPath: activeProfile.McpConfigPath || "",
+    mcpServers: buildMcpServersResponse(config.McpServers || []),
     chatFontScale: config.Ui?.ChatFontScale || 1,
     requireLogin: hasPin(config.Security),
     adaptiveMemory: buildAdaptiveMemoryResponse(config)
@@ -586,26 +570,13 @@ function normalizeSettingsPayload(payload, currentConfig) {
       baseUrl: String(rawProvider.baseUrl ?? (definition.id === activeProvider ? payload?.baseUrl : currentProfile.BaseUrl) ?? "").trim(),
       apiToken: String(rawProvider.apiToken ?? (definition.id === activeProvider ? payload?.apiToken : "") ?? "").trim(),
       keepApiToken: Boolean(rawProvider.keepApiToken ?? (definition.id === activeProvider ? payload?.keepApiToken : Boolean(currentProfile.ApiToken))),
-      mcpConfigPath: definition.supportsMcp
-        ? String(rawProvider.mcpConfigPath ?? (definition.id === activeProvider ? payload?.mcpConfigPath : currentProfile.McpConfigPath) ?? "").trim()
-        : "",
-      mcpConfigUpload: definition.supportsMcp && rawProvider.mcpConfigUpload && typeof rawProvider.mcpConfigUpload === "object"
-        ? {
-            fileName: String(rawProvider.mcpConfigUpload.fileName || "").trim(),
-            content: String(rawProvider.mcpConfigUpload.content || "")
-          }
-        : definition.supportsMcp && definition.id === activeProvider && payload?.mcpConfigUpload && typeof payload.mcpConfigUpload === "object"
-          ? {
-              fileName: String(payload.mcpConfigUpload.fileName || "").trim(),
-              content: String(payload.mcpConfigUpload.content || "")
-            }
-          : null
     };
   }
 
   return {
     activeProvider,
     providers,
+    mcpServers: normalizeMcpServersPayload(payload?.mcpServers),
     chatFontScale: toOptionalFloat(payload?.chatFontScale) || 1,
     requireLogin: Boolean(payload?.requireLogin),
     pin: String(payload?.pin || "").trim(),
@@ -706,20 +677,9 @@ function validateSettings(settings) {
     return adaptiveMemoryErrors;
   }
 
-  const lmStudioSettings = settings.providers?.lmstudio;
-  if (lmStudioSettings?.mcpConfigUpload?.content) {
-    try {
-      const parsed = JSON.parse(lmStudioSettings.mcpConfigUpload.content);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return {
-          mcpConfigUpload: ["Uploaded MCP config must contain a JSON object."]
-        };
-      }
-    } catch {
-      return {
-        mcpConfigUpload: ["Uploaded MCP config must contain valid JSON."]
-      };
-    }
+  const mcpServerErrors = validateMcpServers(settings.mcpServers);
+  if (mcpServerErrors) {
+    return mcpServerErrors;
   }
 
   for (const definition of listProviderDefinitions()) {
@@ -795,14 +755,13 @@ function buildRuntimeSettingsPayload(config) {
       baseUrl: profile.BaseUrl || "",
       apiToken: profile.ApiToken || "",
       keepApiToken: Boolean(profile.ApiToken),
-      mcpConfigPath: profile.McpConfigPath || "",
-      mcpConfigUpload: null,
     };
   }
 
   return {
     activeProvider,
     providers,
+    mcpServers: (config.McpServers || []).map(server => ({ ...server })),
     chatFontScale: config.Ui?.ChatFontScale || 1,
     requireLogin: hasPin(config.Security),
     pin: "",
@@ -853,11 +812,10 @@ function normalizeMcpServerIds(value) {
 async function streamChat(request, response, providerClient, chatRequest, options = {}) {
   const activeProviderId = getActiveProviderId(request.appState.config);
   const activeProviderDefinition = getProviderDefinition(activeProviderId);
-  const activeProviderProfile = getProviderProfile(request.appState.config, activeProviderId);
-  const availableServers = activeProviderDefinition.supportsMcp && activeProviderProfile.McpConfigPath
-    ? await getServers(activeProviderProfile.McpConfigPath)
+  const activeServers = activeProviderDefinition.supportsMcp
+    ? findEnabledServers(request.appState.config.McpServers || [], chatRequest.mcpServerIds || [])
     : [];
-  const integrations = buildMcpIntegrations(availableServers, chatRequest.mcpServerIds || []);
+  const integrations = activeProviderDefinition.kind === "lmstudio" ? buildMcpIntegrations(activeServers) : [];
   const chatConversation = options.persistChatId
     ? request.appState.repository.getChat(options.persistChatId)
     : null;
@@ -926,7 +884,8 @@ async function streamChat(request, response, providerClient, chatRequest, option
       minP: chatRequest.minP,
       repeatPenalty: chatRequest.repeatPenalty,
       previousResponseId: options.previousResponseId || null,
-      integrations: integrations.length > 0 ? integrations : null
+      integrations: integrations.length > 0 ? integrations : null,
+      mcpServers: activeProviderDefinition.kind === "lmstudio" ? null : (activeServers.length > 0 ? activeServers : null)
     }, streamAbortController?.signal, writeStreamEvent);
     if (finalResponse) {
       const assistant = buildAssistantPersistence(finalResponse, chatRequest.model, chatRequest.contextLength, {
@@ -967,38 +926,6 @@ async function streamChat(request, response, providerClient, chatRequest, option
   }
 }
 
-function buildMcpIntegrations(availableServers, selectedServerIds) {
-  const requestedIds = [...new Set((selectedServerIds || [])
-    .map(serverId => normalizeSelectedMcpServerId(serverId))
-    .filter(Boolean)
-    .map(serverId => serverId.toLowerCase()))];
-
-  if (requestedIds.length === 0) {
-    return [];
-  }
-
-  const seen = new Set();
-  const integrations = [];
-
-  for (const server of availableServers) {
-    const serverId = String(server.id || "").toLowerCase();
-    const serverLabel = String(server.label || "").toLowerCase();
-    if (!requestedIds.includes(serverId) && !requestedIds.includes(serverLabel)) {
-      continue;
-    }
-
-    const integrationId = `mcp/${server.id}`;
-    if (seen.has(integrationId.toLowerCase())) {
-      continue;
-    }
-
-    seen.add(integrationId.toLowerCase());
-    integrations.push({ type: "plugin", id: integrationId });
-  }
-
-  return integrations;
-}
-
 function buildConversationMessages(chat) {
   if (!Array.isArray(chat?.messages)) {
     return [];
@@ -1013,10 +940,15 @@ function buildConversationMessages(chat) {
     }));
 }
 
-function normalizeSelectedMcpServerId(serverId) {
-  const normalized = String(serverId || "").trim();
-  return normalized.toLowerCase().startsWith("mcp/") ? normalized.slice(4) : normalized;
+function buildMcpIntegrations(servers) {
+  return (servers || []).map(server => ({
+    type: "ephemeral_mcp",
+    server_label: server.Label,
+    server_url: server.Url,
+    ...(server.Token ? { headers: { Authorization: `Bearer ${server.Token}` } } : {})
+  }));
 }
+
 
 function buildLmStudioInput(chatRequest) {
   const attachments = chatRequest.attachments || [];

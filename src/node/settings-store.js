@@ -11,17 +11,6 @@ function saveSettings(settingsPath, settings, security) {
     ? settings.providers
     : {};
 
-  const lmStudioSettings = rawProviders.lmstudio && typeof rawProviders.lmstudio === "object"
-    ? rawProviders.lmstudio
-    : {};
-  let lmStudioMcpConfigPath = lmStudioSettings.mcpConfigPath || settings.mcpConfigPath || "";
-  const lmStudioMcpUpload = lmStudioSettings.mcpConfigUpload || settings.mcpConfigUpload;
-  if (lmStudioMcpUpload?.content) {
-    const uploadedMcpConfigPath = path.join(settingsDirectory, "mcp.uploaded.json");
-    fs.writeFileSync(uploadedMcpConfigPath, lmStudioMcpUpload.content, "utf8");
-    lmStudioMcpConfigPath = uploadedMcpConfigPath;
-  }
-
   const providerProfiles = {};
   for (const definition of listProviderDefinitions()) {
     const profile = rawProviders[definition.id] && typeof rawProviders[definition.id] === "object"
@@ -31,9 +20,6 @@ function saveSettings(settingsPath, settings, security) {
     providerProfiles[definition.id] = {
       BaseUrl: String(profile.baseUrl || "").trim(),
       ApiToken: String(profile.apiToken || "").trim(),
-      McpConfigPath: definition.supportsMcp
-        ? (definition.id === "lmstudio" ? lmStudioMcpConfigPath : String(profile.mcpConfigPath || "").trim())
-        : ""
     };
   }
 
@@ -59,6 +45,13 @@ function saveSettings(settingsPath, settings, security) {
       ActiveProvider: activeProvider,
       Profiles: providerProfiles
     },
+    McpServers: (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).map(server => ({
+      Id: String(server.Id || server.id || "").trim(),
+      Label: String(server.Label || server.label || "").trim(),
+      Url: String(server.Url || server.url || "").trim(),
+      Token: String(server.Token || server.token || "").trim(),
+      Enabled: server.Enabled !== false && server.enabled !== false,
+    })).filter(server => server.Url),
     Security: {
       PinHash: security.PinHash,
       PinSalt: security.PinSalt,

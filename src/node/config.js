@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { getDefaultChatDefaultsByProvider, getDefaultProviderProfiles, normalizeProviderConfiguration } = require("./provider-config");
+const { normalizeMcpServers } = require("./mcp-config");
 
 function resolveSharedDataDirectory() {
   if (process.env.DATA_DIR) {
@@ -45,6 +46,7 @@ function getDefaultConfig() {
       ActiveProvider: "lmstudio",
       Profiles: defaultProviderProfiles
     },
+    McpServers: [],
     Security: {
       PinHash: "",
       PinSalt: "",
@@ -187,11 +189,6 @@ function applyEnvOverrides(config) {
     next.LmStudio.ApiToken = process.env.LMSTUDIO_API_TOKEN;
   }
 
-  if (process.env.LMSTUDIO_MCP_CONFIG_PATH) {
-    next.LmStudio = next.LmStudio || {};
-    next.LmStudio.McpConfigPath = process.env.LMSTUDIO_MCP_CONFIG_PATH;
-  }
-
   if (process.env.WEB_PORT) {
     next.Web = next.Web || {};
     next.Web.Urls = [`http://0.0.0.0:${process.env.WEB_PORT}`];
@@ -213,6 +210,7 @@ function readConfig(options = {}) {
   const merged = deepMerge(withEnv, loadJsonFile(runtimeSettingsPath));
   const withArgs = applyArgOverrides(merged, process.argv.slice(2));
   const normalizedConfig = normalizeProviderConfiguration(withArgs);
+  normalizedConfig.McpServers = normalizeMcpServers(normalizedConfig.McpServers);
   normalizedConfig.Storage.ConnectionString = normalizeConnectionString(normalizedConfig.Storage.ConnectionString);
   if (typeof normalizedConfig.urls === "string" && normalizedConfig.urls.trim()) {
     normalizedConfig.Web = normalizedConfig.Web || {};

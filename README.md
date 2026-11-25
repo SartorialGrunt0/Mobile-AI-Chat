@@ -6,7 +6,7 @@ This repository now tracks the Node.js runtime, the static client, and Docker an
 
 ## Providers
 
-- **LM Studio** — local LM Studio server, including model load/unload controls and MCP tool selection
+- **LM Studio** — local LM Studio server, including model load/unload controls and MCP tool execution
 - **OpenAI Compatible** — any OpenAI-compatible `/v1` endpoint: OpenAI itself, a llama.cpp or Ollama server on your network, or any hosted OpenAI-style API
 - **Hermes Agent** — a Hermes Agent deployment exposed through its OpenAI-compatible endpoint
 
@@ -21,7 +21,7 @@ Each provider keeps its own base URL and API key, configured per provider on the
 - Streamed responses with live text rendering
 - Expandable reasoning and tool call sections
 - End-of-response stats including tokens per second and input context usage
-- MCP server selection based on the configured `mcp.json`
+- MCP server management (URL + bearer token) with per-chat tool selection
 - Cookie-protected PIN login for LAN use
 
 ## Project Layout
@@ -68,12 +68,10 @@ services:
     environment:
       LMSTUDIO_URL: http://host.docker.internal:1234
       # LMSTUDIO_API_TOKEN: your-token-here
-      # LMSTUDIO_MCP_CONFIG_PATH: /data/mcp.json
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - mobile-lm-studio-data:/data
-      # - ./mcp.json:/data/mcp.json:ro
     restart: unless-stopped
 
 volumes:
@@ -94,7 +92,6 @@ All settings can be passed as environment variables in `docker-compose.yml`, `do
 |---|---|---|
 | `LMSTUDIO_URL` | LM Studio server URL | `http://127.0.0.1:1234` |
 | `LMSTUDIO_API_TOKEN` | Bearer token for LM Studio requests | _(empty)_ |
-| `LMSTUDIO_MCP_CONFIG_PATH` | Path to `mcp.json` inside the container | _(empty)_ |
 | `WEB_PORT` | Port the server listens on | `5080` |
 | `DATA_DIR` | Directory for the SQLite database, runtime settings, and logs | `/data` |
 
@@ -104,17 +101,13 @@ Example overriding the LM Studio host at launch time:
 LMSTUDIO_URL=http://192.168.1.10:1234 docker compose up -d
 ```
 
-### Mounting an MCP config
+### MCP servers
 
-If you use LM Studio MCP tools, mount the config file into the container and point `LMSTUDIO_MCP_CONFIG_PATH` at it:
-
-```yaml
-volumes:
-  - mobile-lm-studio-data:/data
-  - ./mcp.json:/data/mcp.json:ro
-environment:
-  LMSTUDIO_MCP_CONFIG_PATH: /data/mcp.json
-```
+MCP servers are configured in the in-app Settings screen — no files to mount. Each entry is a
+Streamable HTTP MCP endpoint: a label, a URL, and an optional bearer token. Every provider can
+use them: LM Studio receives the enabled servers selected in a chat as ephemeral MCP
+integrations, and the OpenAI-compatible and Hermes Agent providers call their tools directly
+through the chat tool loop.
 
 ### Upgrading
 
@@ -148,7 +141,7 @@ That starts the Node.js server on `http://127.0.0.1:5081`, stores chat data in `
 You can override the main development settings:
 
 ```powershell
-./scripts/dev-server.ps1 -Port 5090 -LmStudioUrl http://127.0.0.1:1234 -McpConfigPath C:\path\to\mcp.json
+./scripts/dev-server.ps1 -Port 5090 -LmStudioUrl http://127.0.0.1:1234
 ```
 
 You can enable, disable, or rotate the UI PIN later from the in-app Settings screen.
@@ -170,8 +163,8 @@ Runtime changes made in the UI are written to `appsettings.runtime.json`, so sav
 - `Providers:ActiveProvider`: the provider the chat uses (`lmstudio`, `openai`, or `hermes-agent`)
 - `Providers:Profiles:<provider-id>`: per-provider `BaseUrl` and `ApiToken`
 - `LmStudio:BaseUrl`: LM Studio server URL (legacy alias for `Providers:Profiles:lmstudio:BaseUrl`)
-- `LmStudio:ApiToken`: bearer token used for LM Studio requests and plugin-based MCP access
-- `LmStudio:McpConfigPath`: path to LM Studio `mcp.json`
+- `LmStudio:ApiToken`: bearer token used for LM Studio requests
+- `McpServers`: the configured MCP server list (`Id`, `Label`, `Url`, `Token`, `Enabled`)
 - `Security:PinHash` and `Security:PinSalt`: PBKDF2-protected PIN values
 - `Storage:ConnectionString`: SQLite connection string
 - `Web:Urls`: URL binding for the server

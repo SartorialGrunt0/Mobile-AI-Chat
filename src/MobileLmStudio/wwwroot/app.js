@@ -47,6 +47,7 @@ const state = {
   pendingStreamRecoveryChatId: null,
   stickToBottom: true,
   editingMessageId: null,
+  draftStopRequested: false,
   editDraftContent: "",
   chatFontScale: 1,
   topBarActionsExpanded: false,
@@ -545,6 +546,33 @@ function bindEvents() {
     updateModelControlValidation();
   });
 
+  // Chat override fields feed the draft live (same pattern as the model
+  // controls); without this, any render() mid-typing re-applies the stale
+  // draft and silently discards what the user typed.
+  elements.chatOverrideSystemPromptInput?.addEventListener("input", () => {
+    if (state.chatOverrideDraft) {
+      state.chatOverrideDraft.systemPrompt = elements.chatOverrideSystemPromptInput.value;
+    }
+  });
+  [
+    [elements.chatOverrideTemperatureInput, "temperature"],
+    [elements.chatOverrideTopKInput, "topK"],
+    [elements.chatOverrideTopPInput, "topP"],
+    [elements.chatOverrideMinPInput, "minP"],
+    [elements.chatOverrideRepeatPenaltyInput, "repeatPenalty"]
+  ].forEach(([input, key]) => {
+    input?.addEventListener("input", () => {
+      if (state.chatOverrideDraft) {
+        state.chatOverrideDraft[key] = input.value;
+      }
+    });
+  });
+  elements.chatOverrideReasoningSelect?.addEventListener("change", () => {
+    if (state.chatOverrideDraft) {
+      state.chatOverrideDraft.reasoning = elements.chatOverrideReasoningSelect.value;
+    }
+  });
+
   elements.reasoningSelect.addEventListener("change", () => {
     state.selectedReasoning = elements.reasoningSelect.value;
   });
@@ -834,7 +862,7 @@ async function login() {
     render();
   } catch (error) {
     elements.loginError.hidden = false;
-    elements.loginError.textContent = error.message || "PIN was not accepted.";
+    elements.loginError.textContent = error?.statusCode === 401 ? "PIN was not accepted." : (error.message || "PIN was not accepted.");
   }
 }
 
@@ -880,6 +908,8 @@ function startNewDraft(options = {}) {
   cancelMessageSpeech();
   closeChatOverrideMenu();
   closeDefaultToolsMenu();
+  state.editingMessageId = null;
+  state.editDraftContent = "";
   ensureSelectionDefaults();
   if (resetConversationSettings) {
     resetDraftConversationState();
@@ -922,6 +952,10 @@ async function openChat(chatId, suppressStatus = false) {
   cancelMessageSpeech();
   closeChatOverrideMenu();
   closeDefaultToolsMenu();
+  // A pending edit belongs to the chat it was started in; carrying it across
+  // chats hides every Edit button with no UI left to clear it.
+  state.editingMessageId = null;
+  state.editDraftContent = "";
   try {
     state.currentChat = normalizeChatRecord(await fetchJson(`/api/chats/${encodeURIComponent(chatId)}`));
     state.currentChatId = state.currentChat.id;
@@ -1168,6 +1202,10 @@ async function sendMessage() {
   state.currentStreamController = streamController;
   state.currentStreamChatId = state.currentChatId || null;
   state.streamControllers.set(state.currentChatId, streamController);
+  // The id THIS stream belongs to (adopted from X-Chat-Id below). Teardown and
+  // post-stream refresh must use this captured value, never the shared global,
+  // which a later send from another chat overwrites.
+  let chatIdForStream = state.currentChatId || null;
 
   try {
     const response = await fetch("/api/chats/stream", {
@@ -1198,6 +1236,19 @@ async function sendMessage() {
       state.currentStreamChatId = newChatId;
       state.streamingChatIds.add(newChatId);
       state.streamControllers.set(newChatId, streamController);
+      chatIdForStream = newChatId;
+    }
+
+    if (state.draftStopRequested) {
+      // Stop was tapped before the draft chat id was known; honour it now that
+      // the chat exists so the server stops generating and the "cancelled"
+      // answer is not persisted.
+      state.draftStopRequested = false;
+      const draftStopId = response.headers.get("X-Chat-Id") || state.currentChatId;
+      if (draftStopId) {
+        fetch(`/api/chats/${encodeURIComponent(draftStopId)}/stop`, { method: "POST", credentials: "same-origin" }).catch(() => {});
+      }
+      streamController.abort();
     }
 
     const wasNewChat = requestBody.chatId === null;
@@ -1209,8 +1260,8 @@ async function sendMessage() {
     }
     await Promise.all([refreshChats(), refreshModels()]);
 
-    if (state.currentChatId) {
-      await openChat(state.currentChatId, true);
+    if (chatIdForStream && state.currentChatId === chatIdForStream) {
+      await openChat(chatIdForStream, true);
     }
 
     if (wasNewChat && chatIdForTitle) {
@@ -1221,8 +1272,10 @@ async function sendMessage() {
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
-      if (state.currentChatId) {
-        try { await openChat(state.currentChatId, true); } catch { }
+      if (chatIdForStream) {
+        if (state.currentChatId === chatIdForStream) {
+          try { await openChat(chatIdForStream, true); } catch { }
+        }
       } else if (state.currentChat?.messages) {
         state.currentChat.messages = state.currentChat.messages.filter(m => m.id !== pendingAssistant.id);
       }
@@ -1238,13 +1291,13 @@ async function sendMessage() {
     setStatus(error.message || "The request failed.", "error");
     renderMessages();
   } finally {
-    const finalStreamId = state.currentStreamChatId;
-    state.currentStreamController = null;
-    state.currentStreamChatId = null;
-    state.streamingChatIds.delete(finalStreamId);
-    state.streamingChatIds.delete(null);
-    state.streamControllers.delete(finalStreamId);
-    state.streamControllers.delete(null);
+    state.draftStopRequested = false;
+    state.streamingChatIds.delete(chatIdForStream);
+    state.streamControllers.delete(chatIdForStream);
+    if (state.currentStreamController === streamController) {
+      state.currentStreamController = null;
+      state.currentStreamChatId = null;
+    }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
   }
@@ -2175,7 +2228,9 @@ async function fetchJson(url, options = {}) {
     if (!options.suppressAuthRedirect) {
       await handleUnauthorized();
     }
-    throw new Error("Authentication required.");
+    const authError = new Error("Authentication required.");
+    authError.statusCode = 401;
+    throw authError;
   }
 
   if (!response.ok) {
@@ -3320,6 +3375,19 @@ function renderChatOverrideMenu() {
     return;
   }
 
+  if (elements.chatOverrideSystemPromptInput === document.activeElement) {
+    state.chatOverrideDraft.systemPrompt = elements.chatOverrideSystemPromptInput.value;
+  }
+  [[elements.chatOverrideTemperatureInput, "temperature"],
+   [elements.chatOverrideTopKInput, "topK"],
+   [elements.chatOverrideTopPInput, "topP"],
+   [elements.chatOverrideMinPInput, "minP"],
+   [elements.chatOverrideRepeatPenaltyInput, "repeatPenalty"]].forEach(([input, key]) => {
+    if (input === document.activeElement) {
+      state.chatOverrideDraft[key] = input.value;
+    }
+  });
+
   elements.chatOverrideSystemPromptInput.value = state.chatOverrideDraft.systemPrompt;
   elements.chatOverrideTemperatureInput.value = state.chatOverrideDraft.temperature;
   elements.chatOverrideTopKInput.value = state.chatOverrideDraft.topK;
@@ -3393,6 +3461,7 @@ async function persistCurrentChatOverrides(options = {}) {
 
   const draft = state.chatOverrideDraft || buildChatOverrideDraft();
   const chatOverrides = buildPersistedChatOverridePayload(draft);
+  const previousSelectedMcpIds = Array.from(state.selectedMcpServerIds);
   state.currentChat.chatOverrides = chatOverrides;
   state.currentChat.selectedMcpServerIds = Array.from(state.selectedMcpServerIds);
 
@@ -3416,8 +3485,15 @@ async function persistCurrentChatOverrides(options = {}) {
       }),
     }));
 
-    state.currentChat = updatedChat;
-    state.selectedMcpServerIds = normalizeSelectedMcpServerIds(updatedChat.selectedMcpServerIds || []);
+    if (state.streamingChatIds.has(state.currentChatId)) {
+      // The server copy lacks the in-flight assistant bubble — merge the
+      // persisted fields instead of replacing the chat mid-stream.
+      state.currentChat.chatOverrides = updatedChat.chatOverrides ?? null;
+      state.currentChat.selectedMcpServerIds = Array.from(updatedChat.selectedMcpServerIds || []);
+    } else {
+      state.currentChat = updatedChat;
+      state.selectedMcpServerIds = normalizeSelectedMcpServerIds(updatedChat.selectedMcpServerIds || []);
+    }
     if (options.closeOnSuccess) {
       closeChatOverrideMenu();
     } else if (!elements.chatOverrideScreen.hidden) {
@@ -3433,9 +3509,14 @@ async function persistCurrentChatOverrides(options = {}) {
     }
     return updatedChat;
   } catch (error) {
-    if (!options.silent) {
-      setStatus(error.message || "Unable to save chat overrides.", "error");
+    // Revert the local chips — a silently-failed toggle must not claim an
+    // unpersisted selection.
+    state.selectedMcpServerIds = previousSelectedMcpIds;
+    if (state.currentChat) {
+      state.currentChat.selectedMcpServerIds = Array.from(previousSelectedMcpIds);
     }
+    renderChatToolsButton();
+    setStatus(error.message || "Unable to save chat settings.", "error");
     return null;
   }
 }
@@ -3477,6 +3558,11 @@ function renderAutoScrollButton() {
 async function deleteChat(chatId) {
   if (!chatId || state.streamingChatIds.has(chatId)) {
     return;
+  }
+
+  if (state.currentChatId === chatId) {
+    state.editingMessageId = null;
+    state.editDraftContent = "";
   }
 
   try {
@@ -3633,6 +3719,7 @@ async function retryLatestPrompt() {
   state.currentStreamController = streamController;
   state.currentStreamChatId = state.currentChatId;
   state.streamControllers.set(state.currentChatId, streamController);
+  const chatIdForStream = state.currentChatId;
 
   try {
     const response = await fetch(`/api/chats/${encodeURIComponent(state.currentChatId)}/retry/stream`, {
@@ -3655,16 +3742,18 @@ async function retryLatestPrompt() {
     await consumeEventStream(response.body, event => applyStreamEvent(event, pendingAssistant));
     await Promise.all([refreshChats(), refreshModels()]);
 
-    if (state.currentChatId) {
-      await openChat(state.currentChatId, true);
+    if (chatIdForStream && state.currentChatId === chatIdForStream) {
+      await openChat(chatIdForStream, true);
     }
 
     setStatus("Response complete.", "neutral");
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
-      if (state.currentChatId) {
-        try { await openChat(state.currentChatId, true); } catch { }
+      if (chatIdForStream) {
+        if (state.currentChatId === chatIdForStream) {
+          try { await openChat(chatIdForStream, true); } catch { }
+        }
       } else if (state.currentChat?.messages) {
         state.currentChat.messages = state.currentChat.messages.filter(m => m.id !== pendingAssistant.id);
       }
@@ -3680,13 +3769,13 @@ async function retryLatestPrompt() {
     setStatus(error.message || "Unable to retry the latest prompt.", "error");
     renderMessages();
   } finally {
-    const finalStreamId = state.currentStreamChatId;
-    state.currentStreamController = null;
-    state.currentStreamChatId = null;
-    state.streamingChatIds.delete(finalStreamId);
-    state.streamingChatIds.delete(null);
-    state.streamControllers.delete(finalStreamId);
-    state.streamControllers.delete(null);
+    state.draftStopRequested = false;
+    state.streamingChatIds.delete(chatIdForStream);
+    state.streamControllers.delete(chatIdForStream);
+    if (state.currentStreamController === streamController) {
+      state.currentStreamController = null;
+      state.currentStreamChatId = null;
+    }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
   }
@@ -3942,6 +4031,7 @@ async function saveAndRegenerateMessage(messageId, newContent) {
   state.currentStreamController = streamController;
   state.currentStreamChatId = state.currentChatId;
   state.streamControllers.set(state.currentChatId, streamController);
+  const chatIdForStream = state.currentChatId;
 
   try {
     const response = await fetch(
@@ -3967,16 +4057,18 @@ async function saveAndRegenerateMessage(messageId, newContent) {
     await consumeEventStream(response.body, event => applyStreamEvent(event, pendingAssistant));
     await Promise.all([refreshChats(), refreshModels()]);
 
-    if (state.currentChatId) {
-      await openChat(state.currentChatId, true);
+    if (chatIdForStream && state.currentChatId === chatIdForStream) {
+      await openChat(chatIdForStream, true);
     }
 
     setStatus("Response complete.", "neutral");
   } catch (error) {
     if (error?.name === "AbortError") {
       setStatus("Stopped.", "neutral");
-      if (state.currentChatId) {
-        try { await openChat(state.currentChatId, true); } catch { }
+      if (chatIdForStream) {
+        if (state.currentChatId === chatIdForStream) {
+          try { await openChat(chatIdForStream, true); } catch { }
+        }
       } else if (state.currentChat?.messages) {
         state.currentChat.messages = state.currentChat.messages.filter(m => m.id !== pendingAssistant.id);
       }
@@ -3991,11 +4083,12 @@ async function saveAndRegenerateMessage(messageId, newContent) {
     setStatus(error.message || "The request failed.", "error");
     renderMessages();
   } finally {
-    const finalStreamId = state.currentStreamChatId;
-    state.currentStreamController = null;
-    state.currentStreamChatId = null;
-    state.streamingChatIds.delete(finalStreamId);
-    state.streamControllers.delete(finalStreamId);
+    state.streamingChatIds.delete(chatIdForStream);
+    state.streamControllers.delete(chatIdForStream);
+    if (state.currentStreamController === streamController) {
+      state.currentStreamController = null;
+      state.currentStreamChatId = null;
+    }
     state.isSending = state.streamingChatIds.size > 0 || state.serverStreamPollChatId !== null;
     render();
   }
@@ -4247,11 +4340,11 @@ function renderInlineMarkdown(value) {
   output = renderInlineMarkdownStyles(output);
 
   htmlTokens.forEach((token, index) => {
-    output = output.replace(`%%HTML${index}%%`, token);
+    output = output.replace(`%%HTML${index}%%`, () => token);
   });
 
   codeTokens.forEach((token, index) => {
-    output = output.replace(`%%CODE${index}%%`, token);
+    output = output.replace(`%%CODE${index}%%`, () => token);
   });
 
   return output;
@@ -4291,6 +4384,13 @@ function renderMathInMarkdown(root) {
 
 function firstFiniteNumber(...values) {
   for (const value of values) {
+    // null/undefined/"" mean "not reported" and must stay null — coercing
+    // Number(null) === 0 would fabricate a reported zero (fake "prompt cache
+    // miss", ~0 prefill, dead context meter). Mirrors provider-client.js.
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+
     const numeric = typeof value === "number" ? value : Number(value);
     if (Number.isFinite(numeric)) {
       return numeric;
@@ -5390,8 +5490,14 @@ function stopStream() {
   if (controller) {
     if (chatId) {
       fetch(`/api/chats/${encodeURIComponent(chatId)}/stop`, { method: "POST", credentials: "same-origin" }).catch(() => {});
+      controller.abort();
+    } else {
+      // First send of a draft: the chat id is not known yet. Defer the stop —
+      // sendMessage POSTs /stop as soon as the X-Chat-Id header arrives, so
+      // the server does not keep generating an answer the user cancelled.
+      state.draftStopRequested = true;
+      setStatus("Stopping...", "busy");
     }
-    controller.abort();
     return;
   }
   if (chatId && state.serverStreamPollChatId === chatId) {

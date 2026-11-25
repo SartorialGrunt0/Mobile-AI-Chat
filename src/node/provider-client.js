@@ -1,4 +1,5 @@
 const { TextDecoder } = require("node:util");
+const { fetchWithHeadersTimeout, readWithIdleTimeout } = require("./fetch-timeout");
 
 // Delta windows shorter than this are frame-coalescing noise, not a measurable
 // decode rate; tokens_per_second is left null for them instead of reporting noise.
@@ -44,8 +45,6 @@ class ProviderClient {
     switch (connection.definition.kind) {
       case "lmstudio":
         return this.lmStudioClient.getModels();
-      case "anthropic":
-        return this.getAnthropicModels(connection);
       default:
         return this.getOpenAiCompatibleModels(connection);
     }
@@ -74,8 +73,6 @@ class ProviderClient {
     switch (connection.definition.kind) {
       case "lmstudio":
         return this.streamLmStudioChat(connection, request, signal, onEvent);
-      case "anthropic":
-        return this.streamAnthropicChat(connection, request, signal, onEvent);
       default:
         return this.streamOpenAiCompatibleChat(connection, request, signal, onEvent);
     }
@@ -166,13 +163,9 @@ class ProviderClient {
 
     const streamStartedAtMs = Date.now();
     let firstDeltaAtMs = null;
-    let lastDeltaAtMs = null;
-
-    const markDeltaTiming = () => {
-      const deltaAtMs = Date.now();
-      firstDeltaAtMs = firstDeltaAtMs ?? deltaAtMs;
-      lastDeltaAtMs = deltaAtMs;
-    };
+    // Decode time is summed PER ROUND so MCP tool execution wall-clock and
+    // per-round request latency are excluded from tokens_per_second.
+    let decodeActiveMs = 0;
 
     const messages = buildOpenAiMessages(request.messages, request.systemPrompt);
     const usageTotals = { input_tokens: null, output_tokens: null, cached_input_tokens: null };
@@ -186,7 +179,20 @@ class ProviderClient {
         throw createAbortError();
       }
 
+      const roundTiming = { first: null, last: null };
+      const markDeltaTiming = () => {
+        const deltaAtMs = Date.now();
+        if (roundTiming.first === null) {
+          roundTiming.first = deltaAtMs;
+        }
+        roundTiming.last = deltaAtMs;
+      };
+
       const roundResult = await streamSingleRound(this, connection, request, messages, toolRegistry, round === 0, signal, onEvent, markDeltaTiming);
+      if (roundTiming.first !== null) {
+        firstDeltaAtMs = firstDeltaAtMs ?? roundTiming.first;
+        decodeActiveMs += Math.max(roundTiming.last - roundTiming.first, 0);
+      }
       responseId = roundResult.responseId || responseId;
       accumulateUsage(usageTotals, roundResult.usage);
       reasoningParts.push(roundResult.reasoning);
@@ -211,10 +217,20 @@ class ProviderClient {
       });
 
       for (const entry of roundResult.toolCalls) {
-        const resolved = toolRegistry.resolve(entry.name);
-        await onEvent("tool_call.start", JSON.stringify({ tool: resolved.displayName }));
+        const resolved = toolRegistry ? toolRegistry.resolve(entry.name) : null;
+        await onEvent("tool_call.start", JSON.stringify({ tool: resolved ? resolved.displayName : entry.name }));
 
-        const parsedArguments = safeParseJson(entry.arguments || "{}") || {};
+        const parsedArguments = entry.arguments ? safeParseJson(entry.arguments) : {};
+        if (!parsedArguments || typeof parsedArguments !== "object") {
+          // Truncated/garbled streamed arguments: do NOT execute the tool with
+          // an empty object — report it so the model can retry (mirrors the
+          // LM Studio path's invalid_tool_call handling).
+          const invalidArgumentsFailure = "The model produced invalid tool arguments; the tool was not executed. Retry with complete, valid JSON arguments.";
+          await onEvent("tool_call.failure", JSON.stringify({ output: invalidArgumentsFailure }));
+          toolCallRecords.push({ tool: resolved?.displayName || entry.name, arguments: {}, output: invalidArgumentsFailure });
+          messages.push({ role: "tool", tool_call_id: entry.id, content: invalidArgumentsFailure });
+          continue;
+        }
         await onEvent("tool_call.arguments", JSON.stringify({ arguments: parsedArguments }));
 
         let toolOutput;
@@ -224,6 +240,10 @@ class ProviderClient {
             : `Unknown tool ${entry.name}.`;
           await onEvent("tool_call.success", JSON.stringify({ output: toolOutput }));
         } catch (error) {
+          if (error?.name === "AbortError" || signal?.aborted) {
+            // A user-initiated stop must propagate, not surface as a tool failure.
+            throw error;
+          }
           toolOutput = `Tool call failed: ${error.message}`;
           await onEvent("tool_call.failure", JSON.stringify({ output: toolOutput }));
         }
@@ -241,98 +261,11 @@ class ProviderClient {
       content: contentParts.filter(Boolean).join("\n"),
       usage: usageTotals,
       toolCalls: toolCallRecords,
-      timings: { streamStartedAtMs, firstDeltaAtMs, lastDeltaAtMs },
+      timings: { streamStartedAtMs, firstDeltaAtMs, decodeActiveMs },
     });
   }
 
-  async streamAnthropicChat(connection, request, signal, onEvent) {
-    const response = await this.sendJson(connection, "POST", "messages", {
-      model: request.model,
-      system: request.systemPrompt || undefined,
-      messages: buildAnthropicMessages(request.messages),
-      max_tokens: resolveAnthropicMaxTokens(request.contextLength),
-      temperature: request.temperature ?? undefined,
-      stream: true,
-    }, {
-      acceptEventStream: true,
-      signal,
-      allowFailure: true,
-    });
 
-    if (!response.ok) {
-      throw new Error(await this.readError(response, connection.definition.displayName));
-    }
-
-    await onEvent("chat.start", JSON.stringify({ model: request.model, provider: connection.providerId }));
-
-    let responseId = null;
-    let usage = null;
-    const reasoning = [];
-    const message = [];
-
-    await consumeSseStream(response.body, async frame => {
-      const payload = String(frame.payload || "").trim();
-      if (!payload) {
-        return;
-      }
-
-      const parsed = safeParseJson(payload);
-      if (!parsed) {
-        return;
-      }
-
-      const eventType = frame.eventType || parsed.type || "";
-      if (eventType === "error" || parsed.type === "error") {
-        throw new Error(parsed.error?.message || parsed.message || `${connection.definition.displayName} returned an error.`);
-      }
-
-      if (eventType === "message_start") {
-        responseId = parsed.message?.id || responseId;
-        usage = mergeUsage(usage, parsed.message?.usage);
-      }
-
-      if (eventType === "content_block_start") {
-        const contentBlock = parsed.content_block || {};
-        const thinking = String(contentBlock.thinking || "");
-        const text = String(contentBlock.text || "");
-        if (thinking) {
-          reasoning.push(thinking);
-          await onEvent("reasoning.delta", JSON.stringify({ content: thinking }));
-        }
-        if (text) {
-          message.push(text);
-          await onEvent("message.delta", JSON.stringify({ content: text }));
-        }
-      }
-
-      if (eventType === "content_block_delta") {
-        const delta = parsed.delta || {};
-        const thinking = String(delta.thinking || delta.reasoning || "");
-        const text = String(delta.text || "");
-        if (thinking) {
-          reasoning.push(thinking);
-          await onEvent("reasoning.delta", JSON.stringify({ content: thinking }));
-        }
-        if (text) {
-          message.push(text);
-          await onEvent("message.delta", JSON.stringify({ content: text }));
-        }
-      }
-
-      if (eventType === "message_delta") {
-        usage = mergeUsage(usage, parsed.usage);
-      }
-    });
-
-    return buildFinalResponse({
-      model: request.model,
-      contextLength: request.contextLength,
-      responseId,
-      reasoning: reasoning.join(""),
-      content: message.join(""),
-      usage,
-    });
-  }
 
   async getOpenAiCompatibleModels(connection) {
     const response = await this.sendJson(connection, "GET", "models", undefined, {
@@ -354,57 +287,10 @@ class ProviderClient {
     return { models };
   }
 
-  async getAnthropicModels(connection) {
-    const response = await this.sendJson(connection, "GET", "models", undefined, {
-      allowFailure: true,
-    });
 
-    if (!response.ok) {
-      if (response.status === 404 || response.status === 405) {
-        return { models: [] };
-      }
-      throw new Error(await this.readError(response, connection.definition.displayName));
-    }
-
-    const payload = await response.json().catch(() => ({ data: [] }));
-    const models = Array.isArray(payload.data)
-      ? payload.data.map(model => mapCompatibleModel({
-          id: model.id,
-          description: model.display_name || model.id,
-        }, connection.definition))
-      : [];
-
-    return { models };
-  }
 
   async generateText(connection, options, allowFailure = false) {
     switch (connection.definition.kind) {
-      case "anthropic": {
-        const response = await this.sendJson(connection, "POST", "messages", {
-          model: options.model,
-          system: options.systemPrompt || undefined,
-          messages: [{ role: "user", content: String(options.userPrompt || "") }],
-          max_tokens: Math.max(64, Math.min(options.maxTokens || 512, 4096)),
-          temperature: options.temperature ?? undefined,
-          stream: false,
-        }, { allowFailure });
-
-        if (!response.ok) {
-          if (allowFailure) {
-            return null;
-          }
-          throw new Error(await this.readError(response, connection.definition.displayName));
-        }
-
-        const payload = await response.json().catch(() => null);
-        const content = Array.isArray(payload?.content)
-          ? payload.content
-            .filter(item => item?.type === "text" && item.text)
-            .map(item => item.text)
-            .join("")
-          : "";
-        return String(content || "").trim() || null;
-      }
       case "lmstudio":
         return null;
       default: {
@@ -446,12 +332,7 @@ class ProviderClient {
       Accept: options.acceptEventStream ? "text/event-stream" : "application/json",
     };
 
-    if (connection.definition.kind === "anthropic") {
-      if (connection.apiToken) {
-        headers["x-api-key"] = connection.apiToken.trim();
-      }
-      headers["anthropic-version"] = "2023-06-01";
-    } else if (connection.apiToken) {
+    if (connection.apiToken) {
       headers.Authorization = `Bearer ${connection.apiToken.trim()}`;
     }
 
@@ -459,7 +340,7 @@ class ProviderClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const response = await fetch(url, {
+    const response = await fetchWithHeadersTimeout(url, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(stripUndefined(body)),
@@ -512,7 +393,7 @@ async function consumeSseStream(sourceStream, onFrame) {
   let dataLines = [];
 
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await readWithIdleTimeout(reader);
     buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
     buffer = buffer.replace(/\r/g, "");
 
@@ -612,29 +493,7 @@ function buildOpenAiMessages(messages, systemPrompt) {
   return payload;
 }
 
-function buildAnthropicMessages(messages) {
-  const payload = [];
-  for (const message of Array.isArray(messages) ? messages : []) {
-    if (message.role === "assistant") {
-      payload.push({
-        role: "assistant",
-        content: String(message.content || ""),
-      });
-      continue;
-    }
 
-    if (message.role !== "user") {
-      continue;
-    }
-
-    payload.push({
-      role: "user",
-      content: buildAnthropicUserContent(message.content, message.attachments),
-    });
-  }
-
-  return payload;
-}
 
 function buildOpenAiUserContent(content, attachments) {
   const safeAttachments = Array.isArray(attachments) ? attachments : [];
@@ -655,33 +514,7 @@ function buildOpenAiUserContent(content, attachments) {
     : promptBlocks;
 }
 
-function buildAnthropicUserContent(content, attachments) {
-  const safeAttachments = Array.isArray(attachments) ? attachments : [];
-  const imageAttachments = safeAttachments.filter(attachment => String(attachment.kind).toLowerCase() === "image" && attachment.dataUrl);
-  const fileAttachments = safeAttachments.filter(attachment => String(attachment.kind).toLowerCase() !== "image");
-  const blocks = [{
-    type: "text",
-    text: buildPromptWithFiles(buildPromptText(content, safeAttachments), fileAttachments),
-  }];
 
-  for (const attachment of imageAttachments) {
-    const parsed = parseDataUrl(attachment.dataUrl);
-    if (!parsed) {
-      continue;
-    }
-
-    blocks.push({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: parsed.mediaType,
-        data: parsed.base64,
-      },
-    });
-  }
-
-  return blocks;
-}
 
 function buildPromptText(content, attachments) {
   const safeAttachments = Array.isArray(attachments) ? attachments : [];
@@ -886,7 +719,7 @@ async function streamSingleRound(providerClient, connection, request, messages, 
     const reasoningDelta = normalizeOpenAiDelta(delta.reasoning_content ?? delta.reasoning ?? delta.reasoningContent ?? null);
     const contentDelta = normalizeOpenAiDelta(delta.content);
 
-    if (reasoningDelta || contentDelta) {
+    if (reasoningDelta || contentDelta || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0)) {
       markDeltaTiming();
     }
 
@@ -1043,8 +876,8 @@ function buildStreamStats(usage, timings) {
 
   const inputTokens = firstFiniteNumber(usage?.input_tokens ?? usage?.prompt_tokens);
   const outputTokens = firstFiniteNumber(usage?.output_tokens ?? usage?.completion_tokens);
-  const decodeSeconds = timings && typeof timings.firstDeltaAtMs === "number" && timings.lastDeltaAtMs > timings.firstDeltaAtMs + MIN_DECODE_WINDOW_MS
-    ? (timings.lastDeltaAtMs - timings.firstDeltaAtMs) / 1000
+  const decodeSeconds = timings && typeof timings.decodeActiveMs === "number"
+    ? timings.decodeActiveMs / 1000
     : null;
   const tokensPerSecond = typeof outputTokens === "number" && outputTokens > 0 && typeof decodeSeconds === "number" && decodeSeconds > 0
     ? outputTokens / decodeSeconds
@@ -1134,14 +967,7 @@ function truncateWords(text, maxWords) {
   return words.slice(0, maxWords).join(" ");
 }
 
-function resolveAnthropicMaxTokens(contextLength) {
-  const numeric = Number.parseInt(String(contextLength || ""), 10);
-  if (!Number.isFinite(numeric)) {
-    return 4096;
-  }
 
-  return Math.max(256, Math.min(Math.floor(numeric / 4), 4096));
-}
 
 module.exports = {
   ProviderClient,

@@ -1,3 +1,5 @@
+const { fetchWithHeadersTimeout } = require("./fetch-timeout");
+
 class LmStudioClient {
   constructor(getConnectionSettings) {
     this.getConnectionSettings = getConnectionSettings;
@@ -123,7 +125,12 @@ class LmStudioClient {
   }
 
   async send(method, routePath, body, options = {}) {
-    const url = new URL(routePath, ensureTrailingSlash(this.getConnectionSettings().baseUrl)).toString();
+    const baseUrl = this.getConnectionSettings().baseUrl;
+    if (!baseUrl) {
+      throw new Error("Set the LM Studio base URL in Settings first.");
+    }
+
+    const url = new URL(routePath, ensureTrailingSlash(baseUrl)).toString();
     const headers = {
       Accept: options.acceptEventStream ? "text/event-stream" : "application/json"
     };
@@ -137,7 +144,7 @@ class LmStudioClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const response = await fetch(url, {
+    const response = await fetchWithHeadersTimeout(url, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

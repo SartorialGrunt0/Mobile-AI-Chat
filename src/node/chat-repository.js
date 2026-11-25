@@ -264,17 +264,24 @@ LIMIT 1;
   }
 
   updateChatOverrides(chatId, chatOverrides, selectedMcpServerIds) {
-    const payload = chatOverrides && typeof chatOverrides === "object"
-      ? JSON.stringify(chatOverrides)
-      : null;
-    const selectedMcpJson = JSON.stringify(Array.isArray(selectedMcpServerIds) ? selectedMcpServerIds : []);
+    // undefined = leave that column untouched; null chatOverrides clears
+    // overrides, [] clears the MCP selection.
+    const sets = ["updated_utc = ?"];
+    const args = [nowIso()];
+    if (chatOverrides !== undefined) {
+      sets.push("chat_overrides_json = ?");
+      args.push(chatOverrides && typeof chatOverrides === "object" ? JSON.stringify(chatOverrides) : null);
+    }
+    if (selectedMcpServerIds !== undefined) {
+      sets.push("selected_mcp_json = ?");
+      args.push(JSON.stringify(Array.isArray(selectedMcpServerIds) ? selectedMcpServerIds : []));
+    }
+
     const result = this.db.prepare(`
 UPDATE chats
-SET selected_mcp_json = ?,
-    chat_overrides_json = ?,
-    updated_utc = ?
+SET ${sets.join(",\n    ")}
 WHERE id = ?;
-`).run(selectedMcpJson, payload, nowIso(), chatId);
+`).run(...args, chatId);
 
     return result.changes > 0;
   }
@@ -461,7 +468,9 @@ WHERE chat_id = ? ORDER BY created_utc ASC, rowid ASC;
 
       const targetIndex = allMessages.findIndex(m => m.id === messageId);
       if (targetIndex === -1) {
-        return null;
+        // undefined = "message not found" (caller should 404), distinct from
+        // null = "truncated, but no previous assistant response exists".
+        return undefined;
       }
 
       let previousResponseId = null;

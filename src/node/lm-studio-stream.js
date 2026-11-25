@@ -1,4 +1,5 @@
 const { TextDecoder } = require("node:util");
+const { readWithIdleTimeout } = require("./fetch-timeout");
 
 async function relayLmStudioStream(sourceStream, onEvent) {
   const reader = sourceStream.getReader();
@@ -9,7 +10,7 @@ async function relayLmStudioStream(sourceStream, onEvent) {
   let finalResponse = null;
 
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await readWithIdleTimeout(reader);
     buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
     buffer = buffer.replace(/\r/g, "");
 
@@ -65,6 +66,13 @@ function captureFinalResponse(eventType, payload, current) {
 
 function firstFiniteNumber(...values) {
   for (const value of values) {
+    // null/undefined/"" mean "not reported" and must stay null — coercing
+    // Number(null) === 0 would fabricate a reported zero (e.g. a fake
+    // "prompt cache miss" where the provider never reports cache telemetry).
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+
     const numeric = typeof value === "number" ? value : Number(value);
     if (Number.isFinite(numeric)) {
       return numeric;
